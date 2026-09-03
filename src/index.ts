@@ -37,7 +37,7 @@ export async function main() {
   const sha256 = (await run('shasum', ['-a', '256', archive], { quiet: true })).trim().split(/\s+/)[0];
   if (!sha256) throw new Error('Could not calculate artifact checksum.');
 
-  const baseURL = (input('api-url') || 'https://simpreview.luma-ai-6308.chatgpt.site').replace(/\/$/, '');
+  const baseURL = (input('api-url') || 'https://simpreview.digitalbunker.dev').replace(/\/$/, '');
   const identity = await oidcToken('simpreview');
   const auth = await api<{ token: string; commitSha: string; pullRequestTitle?: string }>(`${baseURL}/api/v1/auth/github-actions`, { method: 'POST', body: JSON.stringify({ oidcToken: identity, pullRequest: context.number }) });
   if (auth.commitSha !== context.headSHA) throw new Error('GitHub API and workflow event disagree about the pull request head commit.');

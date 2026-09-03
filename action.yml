@@ -31,7 +31,7 @@ inputs:
   api-url:
     description: SimPreview API origin.
     required: false
-    default: https://simpreview.luma-ai-6308.chatgpt.site
+    default: https://simpreview.digitalbunker.dev
 outputs:
   preview-id:
     description: Published preview identifier.
