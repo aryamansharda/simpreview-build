@@ -193,7 +193,7 @@ async function main() {
     await rm(archive, { force: true });
     await run("ditto", ["-c", "-k", "--sequesterRsrc", "--keepParent", appPath, archive], { quiet: true });
     size = (await stat2(archive)).size;
-    sha256 = (await run("shasum", ["-a", "256", archive], { quiet: true })).trim().split(/\s+/)[0];
+    sha256 = (await run("shasum", ["-a", "256", archive], { quiet: true })).trim().split(/\s+/)[0] ?? "";
     if (!sha256) throw new Error("Could not calculate artifact checksum.");
   } catch (error) {
     await reportFailure(error instanceof Error ? error.message : String(error));
