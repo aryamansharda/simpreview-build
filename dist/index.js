@@ -1,0 +1,206 @@
+import { createRequire as __createRequire } from "module";const require=__createRequire(import.meta.url);
+
+// src/index.ts
+import { mkdir, readFile as readFile2, rm, stat as stat2 } from "node:fs/promises";
+import path2 from "node:path";
+
+// src/api.ts
+async function api(url, init = {}) {
+  const headers = new Headers(init.headers);
+  headers.set("accept", "application/json");
+  if (init.body) headers.set("content-type", "application/json");
+  const response = await fetch(url, { ...init, headers });
+  const body = await response.json();
+  if (!response.ok) throw new Error(body.error?.message || `SimPreview API returned ${response.status}.`);
+  return body;
+}
+
+// src/action-io.ts
+import { appendFile } from "node:fs/promises";
+function input(name, required = false) {
+  const key = `INPUT_${name.replaceAll("-", "_").toUpperCase()}`;
+  const value = process.env[key]?.trim() ?? "";
+  if (required && !value) throw new Error(`Input \`${name}\` is required.`);
+  return value;
+}
+async function output(name, value) {
+  const path3 = process.env.GITHUB_OUTPUT;
+  if (!path3) return;
+  await appendFile(path3, `${name}=${value}
+`, "utf8");
+}
+function mask(value) {
+  process.stdout.write(`::add-mask::${value}
+`);
+}
+function notice(message) {
+  process.stdout.write(`${message}
+`);
+}
+function fail(error) {
+  const message = error instanceof Error ? error.message : String(error);
+  process.stdout.write(`::error title=SimPreview::${message.replaceAll("\n", "%0A")}
+`);
+  process.exitCode = 1;
+}
+
+// src/github.ts
+function pullRequestContext(event) {
+  const root = event;
+  const number = root.pull_request?.number ?? root.number;
+  const branch = root.pull_request?.head?.ref;
+  const headSHA = root.pull_request?.head?.sha;
+  if (!number || !branch || !headSHA || !/^[0-9a-f]{40}$/.test(headSHA)) throw new Error("SimPreview must run from a pull_request workflow event.");
+  return { number, title: root.pull_request?.title, branch, headSHA };
+}
+async function oidcToken(audience) {
+  const endpoint = process.env.ACTIONS_ID_TOKEN_REQUEST_URL;
+  const bearer = process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN;
+  if (!endpoint || !bearer) throw new Error("GitHub OIDC is unavailable. Add `permissions: id-token: write` to this job.");
+  const url = new URL(endpoint);
+  url.searchParams.set("audience", audience);
+  const response = await fetch(url, { headers: { authorization: `Bearer ${bearer}` } });
+  const body = await response.json();
+  if (!response.ok || !body.value) throw new Error(body.message || "GitHub did not issue an OIDC token.");
+  return body.value;
+}
+
+// src/inspect.ts
+import { access, readdir, stat } from "node:fs/promises";
+import path from "node:path";
+
+// src/process.ts
+import { spawn } from "node:child_process";
+async function run(command, args, options = {}) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, { cwd: options.cwd, env: process.env, stdio: ["ignore", "pipe", "pipe"] });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk) => {
+      const text = chunk.toString();
+      stdout += text;
+      if (!options.quiet) process.stdout.write(text);
+    });
+    child.stderr.on("data", (chunk) => {
+      const text = chunk.toString();
+      stderr += text;
+      if (!options.quiet) process.stderr.write(text);
+    });
+    child.on("error", reject);
+    child.on("close", (code) => code === 0 ? resolve(stdout) : reject(new Error(`${command} exited with ${code}.
+${stderr.slice(-4e3)}`)));
+  });
+}
+async function runShell(script) {
+  return run("/bin/zsh", ["-eo", "pipefail", "-c", script]);
+}
+
+// src/inspect.ts
+async function detectContainer(root, workspace, project) {
+  if (workspace && project) throw new Error("Provide either workspace or project, not both.");
+  if (workspace) return ["-workspace", workspace];
+  if (project) return ["-project", project];
+  const entries = await readdir(root);
+  const detectedWorkspace = entries.find((name) => name.endsWith(".xcworkspace"));
+  if (detectedWorkspace) return ["-workspace", detectedWorkspace];
+  const detectedProject = entries.find((name) => name.endsWith(".xcodeproj"));
+  if (detectedProject) return ["-project", detectedProject];
+  throw new Error("No .xcworkspace or .xcodeproj was found. Set the workspace or project input.");
+}
+async function findApp(derivedData, explicit) {
+  if (explicit) {
+    await access(explicit);
+    return path.resolve(explicit);
+  }
+  const products = path.join(derivedData, "Build", "Products");
+  const found = [];
+  async function walk(directory) {
+    for (const entry of await readdir(directory, { withFileTypes: true })) {
+      const file = path.join(directory, entry.name);
+      if (entry.isDirectory() && entry.name.endsWith(".app")) found.push({ file, modified: (await stat(file)).mtimeMs });
+      else if (entry.isDirectory()) await walk(file);
+    }
+  }
+  await walk(products);
+  found.sort((a, b) => b.modified - a.modified);
+  if (!found[0]) throw new Error("Xcode completed but no .app product was found in DerivedData.");
+  return found[0].file;
+}
+async function inspectApp(appPath) {
+  const plistPath = path.join(appPath, "Info.plist");
+  const json = await run("plutil", ["-convert", "json", "-o", "-", plistPath], { quiet: true });
+  const plist = JSON.parse(json);
+  const executable = requiredString(plist, "CFBundleExecutable");
+  const binary = path.join(appPath, executable);
+  const archOutput = await run("lipo", ["-archs", binary], { quiet: true });
+  const architectures = archOutput.trim().split(/\s+/).filter((arch) => arch === "arm64" || arch === "x86_64");
+  const platform = requiredString(plist, "DTPlatformName");
+  if (platform !== "iphonesimulator") throw new Error(`Expected an iOS Simulator product, received \`${platform}\`.`);
+  if (!architectures.length) throw new Error("The app does not contain an arm64 or x86_64 Simulator architecture.");
+  return { bundleId: requiredString(plist, "CFBundleIdentifier"), displayName: optionalString(plist, "CFBundleDisplayName") || optionalString(plist, "CFBundleName") || path.basename(appPath, ".app"), minimumOSVersion: requiredString(plist, "MinimumOSVersion"), platform, architectures: [...new Set(architectures)], xcodeVersion: optionalString(plist, "DTXcodeBuild") || (await run("xcodebuild", ["-version"], { quiet: true })).trim().replaceAll("\n", " ") };
+}
+function requiredString(plist, key) {
+  const value = optionalString(plist, key);
+  if (!value) throw new Error(`Built app is missing ${key} in Info.plist.`);
+  return value;
+}
+function optionalString(plist, key) {
+  return typeof plist[key] === "string" ? plist[key] : "";
+}
+
+// src/index.ts
+async function main() {
+  const root = process.env.GITHUB_WORKSPACE || process.cwd();
+  const scheme = input("scheme", true);
+  const configuration = input("configuration") || "Debug";
+  const derivedData = path2.resolve(root, input("derived-data-path") || ".simpreview/DerivedData");
+  const customCommand = input("build-command");
+  const eventPath = process.env.GITHUB_EVENT_PATH;
+  if (!eventPath) throw new Error("GitHub pull request context is unavailable.");
+  const context = pullRequestContext(JSON.parse(await readFile2(eventPath, "utf8")));
+  await mkdir(path2.dirname(derivedData), { recursive: true });
+  notice("SimPreview \xB7 Building iOS Simulator product");
+  if (customCommand) await runShell(customCommand);
+  else if (!input("app-path")) {
+    const container = await detectContainer(root, input("workspace"), input("project"));
+    await run("xcodebuild", [...container, "-scheme", scheme, "-configuration", configuration, "-sdk", "iphonesimulator", "-destination", "generic/platform=iOS Simulator", "-derivedDataPath", derivedData, "CODE_SIGNING_ALLOWED=NO", "build"], { cwd: root });
+  }
+  const appPath = await findApp(derivedData, input("app-path"));
+  const metadata = await inspectApp(appPath);
+  notice(`SimPreview \xB7 Validated ${metadata.displayName} (${metadata.architectures.join(", ")})`);
+  const staging = path2.resolve(root, ".simpreview");
+  const archive = path2.join(staging, "artifact.zip");
+  await mkdir(staging, { recursive: true });
+  await rm(archive, { force: true });
+  await run("ditto", ["-c", "-k", "--sequesterRsrc", "--keepParent", appPath, archive], { quiet: true });
+  const size = (await stat2(archive)).size;
+  const sha256 = (await run("shasum", ["-a", "256", archive], { quiet: true })).trim().split(/\s+/)[0];
+  if (!sha256) throw new Error("Could not calculate artifact checksum.");
+  const baseURL = (input("api-url") || "https://simpreview.luma-ai-6308.chatgpt.site").replace(/\/$/, "");
+  const identity = await oidcToken("simpreview");
+  const auth = await api(`${baseURL}/api/v1/auth/github-actions`, { method: "POST", body: JSON.stringify({ oidcToken: identity, pullRequest: context.number }) });
+  if (auth.commitSha !== context.headSHA) throw new Error("GitHub API and workflow event disagree about the pull request head commit.");
+  mask(auth.token);
+  const headers = { authorization: `Bearer ${auth.token}` };
+  const created = await api(`${baseURL}/api/v1/previews`, { method: "POST", headers, body: JSON.stringify({ pullRequest: context.number, pullRequestTitle: auth.pullRequestTitle || context.title, commitSha: context.headSHA, branch: context.branch, scheme, configuration, ...metadata, artifactSize: size, sha256 }) });
+  if (created.preview.status !== "ready") {
+    if (!created.upload) throw new Error("The preview is not ready and no artifact upload URL was returned.");
+    const bytes = await readFile2(archive);
+    const upload = await fetch(created.upload.url, { method: "PUT", body: bytes, headers: { "content-type": "application/zip" } });
+    if (!upload.ok) throw new Error(`Artifact upload failed with ${upload.status}.`);
+  }
+  const completion = await fetch(`${baseURL}/api/v1/previews/${created.preview.previewId}/complete`, { method: "POST", headers: { ...headers, accept: "application/json" } });
+  if (!completion.ok) {
+    const body = await completion.json().catch(() => ({}));
+    throw new Error(body.error?.message || `SimPreview API returned ${completion.status}.`);
+  }
+  if (completion.headers.get("x-simpreview-comment") === "failed") notice("::warning title=SimPreview::The build is ready but the pull request comment could not be updated. Check the GitHub App installation permissions.");
+  const previewURL = `${baseURL}/p/${created.preview.previewId}`;
+  await output("preview-id", created.preview.previewId);
+  await output("preview-url", previewURL);
+  notice(`SimPreview \xB7 Ready ${previewURL}`);
+}
+if (process.env.NODE_ENV !== "test") main().catch(fail);
+export {
+  main
+};

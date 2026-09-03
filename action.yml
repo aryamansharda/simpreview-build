@@ -1,0 +1,42 @@
+name: SimPreview Build
+description: Build an iOS Simulator app and publish a private SimPreview for the current pull request.
+author: SimPreview
+branding:
+  icon: play
+  color: green
+inputs:
+  scheme:
+    description: Shared Xcode scheme to build.
+    required: true
+  workspace:
+    description: Path to an .xcworkspace. Auto-detected when omitted.
+    required: false
+  project:
+    description: Path to an .xcodeproj. Auto-detected when no workspace exists.
+    required: false
+  configuration:
+    description: Xcode build configuration.
+    required: false
+    default: Debug
+  derived-data-path:
+    description: Directory for Xcode DerivedData.
+    required: false
+    default: .simpreview/DerivedData
+  build-command:
+    description: Optional complete build command for advanced projects.
+    required: false
+  app-path:
+    description: Optional path to an existing Simulator .app product.
+    required: false
+  api-url:
+    description: SimPreview API origin.
+    required: false
+    default: https://simpreview.luma-ai-6308.chatgpt.site
+outputs:
+  preview-id:
+    description: Published preview identifier.
+  preview-url:
+    description: Browser URL for the private preview.
+runs:
+  using: node24
+  main: dist/index.js
