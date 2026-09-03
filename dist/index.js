@@ -158,28 +158,50 @@ async function main() {
   const eventPath = process.env.GITHUB_EVENT_PATH;
   if (!eventPath) throw new Error("GitHub pull request context is unavailable.");
   const context = pullRequestContext(JSON.parse(await readFile2(eventPath, "utf8")));
-  await mkdir(path2.dirname(derivedData), { recursive: true });
-  notice("SimPreview \xB7 Building iOS Simulator product");
-  if (customCommand) await runShell(customCommand);
-  else if (!input("app-path")) {
-    const container = await detectContainer(root, input("workspace"), input("project"));
-    await run("xcodebuild", [...container, "-scheme", scheme, "-configuration", configuration, "-sdk", "iphonesimulator", "-destination", "generic/platform=iOS Simulator", "-derivedDataPath", derivedData, "CODE_SIGNING_ALLOWED=NO", "build"], { cwd: root });
-  }
-  const appPath = await findApp(derivedData, input("app-path"));
-  const metadata = await inspectApp(appPath);
-  notice(`SimPreview \xB7 Validated ${metadata.displayName} (${metadata.architectures.join(", ")})`);
-  const staging = path2.resolve(root, ".simpreview");
-  const archive = path2.join(staging, "artifact.zip");
-  await mkdir(staging, { recursive: true });
-  await rm(archive, { force: true });
-  await run("ditto", ["-c", "-k", "--sequesterRsrc", "--keepParent", appPath, archive], { quiet: true });
-  const size = (await stat2(archive)).size;
-  const sha256 = (await run("shasum", ["-a", "256", archive], { quiet: true })).trim().split(/\s+/)[0];
-  if (!sha256) throw new Error("Could not calculate artifact checksum.");
   const baseURL = (input("api-url") || "https://simpreview.digitalbunker.dev").replace(/\/$/, "");
-  const identity = await oidcToken("simpreview");
-  const auth = await api(`${baseURL}/api/v1/auth/github-actions`, { method: "POST", body: JSON.stringify({ oidcToken: identity, pullRequest: context.number }) });
-  if (auth.commitSha !== context.headSHA) throw new Error("GitHub API and workflow event disagree about the pull request head commit.");
+  const authenticate = async (phase) => {
+    const identity = await oidcToken("simpreview");
+    const result = await api(`${baseURL}/api/v1/auth/github-actions`, { method: "POST", body: JSON.stringify({ oidcToken: identity, pullRequest: context.number, phase }) });
+    if (result.commitSha !== context.headSHA) throw new Error("GitHub API and workflow event disagree about the pull request head commit.");
+    mask(result.token);
+    return result;
+  };
+  let auth = await authenticate("building");
+  const authenticatedAt = Date.now();
+  const reportFailure = async (detail) => {
+    await fetch(`${baseURL}/api/v1/workflow/status`, { method: "POST", headers: { authorization: `Bearer ${auth.token}`, "content-type": "application/json" }, body: JSON.stringify({ phase: "failed", detail }) }).catch(() => void 0);
+  };
+  let appPath;
+  let metadata;
+  let archive;
+  let size;
+  let sha256;
+  try {
+    await mkdir(path2.dirname(derivedData), { recursive: true });
+    notice("SimPreview \xB7 Building iOS Simulator product");
+    if (customCommand) await runShell(customCommand);
+    else if (!input("app-path")) {
+      const container = await detectContainer(root, input("workspace"), input("project"));
+      await run("xcodebuild", [...container, "-scheme", scheme, "-configuration", configuration, "-sdk", "iphonesimulator", "-destination", "generic/platform=iOS Simulator", "-derivedDataPath", derivedData, "CODE_SIGNING_ALLOWED=NO", "build"], { cwd: root });
+    }
+    appPath = await findApp(derivedData, input("app-path"));
+    metadata = await inspectApp(appPath);
+    notice(`SimPreview \xB7 Validated ${metadata.displayName} (${metadata.architectures.join(", ")})`);
+    const staging = path2.resolve(root, ".simpreview");
+    archive = path2.join(staging, "artifact.zip");
+    await mkdir(staging, { recursive: true });
+    await rm(archive, { force: true });
+    await run("ditto", ["-c", "-k", "--sequesterRsrc", "--keepParent", appPath, archive], { quiet: true });
+    size = (await stat2(archive)).size;
+    sha256 = (await run("shasum", ["-a", "256", archive], { quiet: true })).trim().split(/\s+/)[0];
+    if (!sha256) throw new Error("Could not calculate artifact checksum.");
+  } catch (error) {
+    await reportFailure(error instanceof Error ? error.message : String(error));
+    throw error;
+  }
+  if (Date.now() - authenticatedAt > 20 * 60 * 1e3) {
+    auth = await authenticate("none");
+  }
   mask(auth.token);
   const headers = { authorization: `Bearer ${auth.token}` };
   const created = await api(`${baseURL}/api/v1/previews`, { method: "POST", headers, body: JSON.stringify({ pullRequest: context.number, pullRequestTitle: auth.pullRequestTitle || context.title, commitSha: context.headSHA, branch: context.branch, scheme, configuration, ...metadata, artifactSize: size, sha256 }) });
