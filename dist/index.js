@@ -1,8 +1,10 @@
 import { createRequire as __createRequire } from "module";const require=__createRequire(import.meta.url);
 
 // src/index.ts
-import { mkdir, readFile as readFile2, rm, stat as stat2 } from "node:fs/promises";
+import { createReadStream } from "node:fs";
+import { mkdir, readFile, rm, stat as stat2 } from "node:fs/promises";
 import path2 from "node:path";
+import { Readable } from "node:stream";
 
 // src/api.ts
 async function api(url, init = {}) {
@@ -11,7 +13,7 @@ async function api(url, init = {}) {
   if (init.body) headers.set("content-type", "application/json");
   const response = await fetch(url, { ...init, headers });
   const body = await response.json();
-  if (!response.ok) throw new Error(body.error?.message || `SimPreview API returned ${response.status}.`);
+  if (!response.ok) throw new Error(body.error?.message || `Presto API returned ${response.status}.`);
   return body;
 }
 
@@ -39,7 +41,7 @@ function notice(message) {
 }
 function fail(error) {
   const message = error instanceof Error ? error.message : String(error);
-  process.stdout.write(`::error title=SimPreview::${message.replaceAll("\n", "%0A")}
+  process.stdout.write(`::error title=Presto::${message.replaceAll("\n", "%0A")}
 `);
   process.exitCode = 1;
 }
@@ -50,7 +52,7 @@ function pullRequestContext(event) {
   const number = root.pull_request?.number ?? root.number;
   const branch = root.pull_request?.head?.ref;
   const headSHA = root.pull_request?.head?.sha;
-  if (!number || !branch || !headSHA || !/^[0-9a-f]{40}$/.test(headSHA)) throw new Error("SimPreview must run from a pull_request workflow event.");
+  if (!number || !branch || !headSHA || !/^[0-9a-f]{40}$/.test(headSHA)) throw new Error("Presto must run from a pull_request workflow event.");
   return { number, title: root.pull_request?.title, branch, headSHA };
 }
 async function oidcToken(audience) {
@@ -100,17 +102,60 @@ async function detectContainer(root, workspace, project) {
   if (workspace && project) throw new Error("Provide either workspace or project, not both.");
   if (workspace) return ["-workspace", workspace];
   if (project) return ["-project", project];
-  const entries = await readdir(root);
-  const detectedWorkspace = entries.find((name) => name.endsWith(".xcworkspace"));
-  if (detectedWorkspace) return ["-workspace", detectedWorkspace];
-  const detectedProject = entries.find((name) => name.endsWith(".xcodeproj"));
-  if (detectedProject) return ["-project", detectedProject];
+  const containers = await discoverContainers(root);
+  if (containers.workspaces.length === 1) return ["-workspace", containers.workspaces[0]];
+  if (containers.workspaces.length > 1) throw new Error(`More than one Xcode workspace was found (${containers.workspaces.join(", ")}). Set the workspace input.`);
+  if (containers.projects.length === 1) return ["-project", containers.projects[0]];
+  if (containers.projects.length > 1) throw new Error(`More than one Xcode project was found (${containers.projects.join(", ")}). Set the project input.`);
   throw new Error("No .xcworkspace or .xcodeproj was found. Set the workspace or project input.");
 }
-async function findApp(derivedData, explicit) {
+var ignoredContainerDirectories = /* @__PURE__ */ new Set([".git", ".build", ".presto", "build", "Carthage", "DerivedData", "node_modules", "Pods"]);
+async function discoverContainers(root) {
+  const workspaces = [];
+  const projects = [];
+  async function walk(directory, depth) {
+    if (depth > 4) return;
+    const entries = await readdir(directory, { withFileTypes: true });
+    for (const entry of entries) {
+      if (!entry.isDirectory() || ignoredContainerDirectories.has(entry.name)) continue;
+      const absolute = path.join(directory, entry.name);
+      const relative = path.relative(root, absolute);
+      if (entry.name.endsWith(".xcworkspace")) workspaces.push(relative);
+      else if (entry.name.endsWith(".xcodeproj")) projects.push(relative);
+      else await walk(absolute, depth + 1);
+    }
+  }
+  await walk(root, 0);
+  return { workspaces: workspaces.sort(), projects: projects.sort() };
+}
+function simulatorAppPathsFromBuildSettings(output2) {
+  let entries;
+  try {
+    entries = JSON.parse(output2);
+  } catch {
+    throw new Error("Xcode returned unreadable build settings. Set the app-path input to the Simulator .app product.");
+  }
+  if (!Array.isArray(entries)) throw new Error("Xcode returned unreadable build settings. Set the app-path input to the Simulator .app product.");
+  return entries.flatMap(({ buildSettings = {} }) => {
+    if (buildSettings.PRODUCT_TYPE !== "com.apple.product-type.application" || buildSettings.PLATFORM_NAME !== "iphonesimulator") return [];
+    const directory = buildSettings.TARGET_BUILD_DIR;
+    const wrapper = buildSettings.WRAPPER_NAME;
+    return directory && wrapper ? [path.join(directory, wrapper)] : [];
+  });
+}
+async function findApp(derivedData, explicit, buildSettingsOutput) {
   if (explicit) {
     await access(explicit);
     return path.resolve(explicit);
+  }
+  if (buildSettingsOutput) {
+    const candidates = [...new Set(simulatorAppPathsFromBuildSettings(buildSettingsOutput))];
+    if (candidates.length > 1) throw new Error(`The scheme builds more than one iOS app (${candidates.map((candidate) => path.basename(candidate)).join(", ")}). Set the app-path input to the app reviewers should run.`);
+    if (candidates[0]) {
+      await access(candidates[0]);
+      return candidates[0];
+    }
+    throw new Error("The selected scheme did not produce an iOS Simulator app. Set the scheme or app-path input.");
   }
   const products = path.join(derivedData, "Build", "Products");
   const found = [];
@@ -124,6 +169,7 @@ async function findApp(derivedData, explicit) {
   await walk(products);
   found.sort((a, b) => b.modified - a.modified);
   if (!found[0]) throw new Error("Xcode completed but no .app product was found in DerivedData.");
+  if (found.length > 1) throw new Error(`More than one .app product was found (${found.map((candidate) => path.basename(candidate.file)).join(", ")}). Set the app-path input to the app reviewers should run.`);
   return found[0].file;
 }
 async function inspectApp(appPath) {
@@ -153,14 +199,14 @@ async function main() {
   const root = process.env.GITHUB_WORKSPACE || process.cwd();
   const scheme = input("scheme", true);
   const configuration = input("configuration") || "Debug";
-  const derivedData = path2.resolve(root, input("derived-data-path") || ".simpreview/DerivedData");
+  const derivedData = path2.resolve(root, input("derived-data-path") || ".presto/DerivedData");
   const customCommand = input("build-command");
   const eventPath = process.env.GITHUB_EVENT_PATH;
   if (!eventPath) throw new Error("GitHub pull request context is unavailable.");
-  const context = pullRequestContext(JSON.parse(await readFile2(eventPath, "utf8")));
-  const baseURL = (input("api-url") || "https://simpreview.digitalbunker.dev").replace(/\/$/, "");
+  const context = pullRequestContext(JSON.parse(await readFile(eventPath, "utf8")));
+  const baseURL = (input("api-url") || "https://presto.digitalbunker.dev").replace(/\/$/, "");
   const authenticate = async (phase) => {
-    const identity = await oidcToken("simpreview");
+    const identity = await oidcToken("presto");
     const result = await api(`${baseURL}/api/v1/auth/github-actions`, { method: "POST", body: JSON.stringify({ oidcToken: identity, pullRequest: context.number, phase }) });
     if (result.commitSha !== context.headSHA) throw new Error("GitHub API and workflow event disagree about the pull request head commit.");
     mask(result.token);
@@ -178,16 +224,19 @@ async function main() {
   let sha256;
   try {
     await mkdir(path2.dirname(derivedData), { recursive: true });
-    notice("SimPreview \xB7 Building iOS Simulator product");
+    notice("Presto \xB7 Building iOS Simulator product");
+    let buildSettingsOutput;
     if (customCommand) await runShell(customCommand);
     else if (!input("app-path")) {
       const container = await detectContainer(root, input("workspace"), input("project"));
-      await run("xcodebuild", [...container, "-scheme", scheme, "-configuration", configuration, "-sdk", "iphonesimulator", "-destination", "generic/platform=iOS Simulator", "-derivedDataPath", derivedData, "CODE_SIGNING_ALLOWED=NO", "build"], { cwd: root });
+      const buildArguments = [...container, "-scheme", scheme, "-configuration", configuration, "-sdk", "iphonesimulator", "-destination", "generic/platform=iOS Simulator", "-derivedDataPath", derivedData, "CODE_SIGNING_ALLOWED=NO"];
+      await run("xcodebuild", [...buildArguments, "build"], { cwd: root });
+      buildSettingsOutput = await run("xcodebuild", [...buildArguments, "-showBuildSettings", "-json"], { cwd: root, quiet: true });
     }
-    appPath = await findApp(derivedData, input("app-path"));
+    appPath = await findApp(derivedData, input("app-path"), buildSettingsOutput);
     metadata = await inspectApp(appPath);
-    notice(`SimPreview \xB7 Validated ${metadata.displayName} (${metadata.architectures.join(", ")})`);
-    const staging = path2.resolve(root, ".simpreview");
+    notice(`Presto \xB7 Validated ${metadata.displayName} (${metadata.architectures.join(", ")})`);
+    const staging = path2.resolve(root, ".presto");
     archive = path2.join(staging, "artifact.zip");
     await mkdir(staging, { recursive: true });
     await rm(archive, { force: true });
@@ -199,28 +248,37 @@ async function main() {
     await reportFailure(error instanceof Error ? error.message : String(error));
     throw error;
   }
-  if (Date.now() - authenticatedAt > 20 * 60 * 1e3) {
-    auth = await authenticate("none");
+  try {
+    if (Date.now() - authenticatedAt > 20 * 60 * 1e3) {
+      auth = await authenticate("none");
+    }
+    mask(auth.token);
+    const headers = { authorization: `Bearer ${auth.token}` };
+    const created = await api(`${baseURL}/api/v1/previews`, { method: "POST", headers, body: JSON.stringify({ pullRequest: context.number, pullRequestTitle: auth.pullRequestTitle || context.title, commitSha: context.headSHA, branch: context.branch, scheme, configuration, ...metadata, artifactSize: size, sha256 }) });
+    if (created.preview.status !== "ready") {
+      if (!created.upload) throw new Error("The preview is not ready and no artifact upload URL was returned.");
+      const upload = await fetch(created.upload.url, {
+        method: "PUT",
+        body: Readable.toWeb(createReadStream(archive)),
+        duplex: "half",
+        headers: { "content-type": "application/zip", "content-length": String(size) }
+      });
+      if (!upload.ok) throw new Error(`Artifact upload failed with ${upload.status}.`);
+    }
+    const completion = await fetch(`${baseURL}/api/v1/previews/${created.preview.previewId}/complete`, { method: "POST", headers: { ...headers, accept: "application/json" } });
+    if (!completion.ok) {
+      const body = await completion.json().catch(() => ({}));
+      throw new Error(body.error?.message || `Presto API returned ${completion.status}.`);
+    }
+    if (completion.headers.get("x-presto-comment") === "failed") notice("::warning title=Presto::The build is ready but the pull request comment could not be updated. Check the GitHub App installation permissions.");
+    const previewURL = `${baseURL}/p/${created.preview.previewId}`;
+    await output("preview-id", created.preview.previewId);
+    await output("preview-url", previewURL);
+    notice(`Presto \xB7 Ready ${previewURL}`);
+  } catch (error) {
+    await reportFailure(error instanceof Error ? error.message : String(error));
+    throw error;
   }
-  mask(auth.token);
-  const headers = { authorization: `Bearer ${auth.token}` };
-  const created = await api(`${baseURL}/api/v1/previews`, { method: "POST", headers, body: JSON.stringify({ pullRequest: context.number, pullRequestTitle: auth.pullRequestTitle || context.title, commitSha: context.headSHA, branch: context.branch, scheme, configuration, ...metadata, artifactSize: size, sha256 }) });
-  if (created.preview.status !== "ready") {
-    if (!created.upload) throw new Error("The preview is not ready and no artifact upload URL was returned.");
-    const bytes = await readFile2(archive);
-    const upload = await fetch(created.upload.url, { method: "PUT", body: bytes, headers: { "content-type": "application/zip" } });
-    if (!upload.ok) throw new Error(`Artifact upload failed with ${upload.status}.`);
-  }
-  const completion = await fetch(`${baseURL}/api/v1/previews/${created.preview.previewId}/complete`, { method: "POST", headers: { ...headers, accept: "application/json" } });
-  if (!completion.ok) {
-    const body = await completion.json().catch(() => ({}));
-    throw new Error(body.error?.message || `SimPreview API returned ${completion.status}.`);
-  }
-  if (completion.headers.get("x-simpreview-comment") === "failed") notice("::warning title=SimPreview::The build is ready but the pull request comment could not be updated. Check the GitHub App installation permissions.");
-  const previewURL = `${baseURL}/p/${created.preview.previewId}`;
-  await output("preview-id", created.preview.previewId);
-  await output("preview-url", previewURL);
-  notice(`SimPreview \xB7 Ready ${previewURL}`);
 }
 if (process.env.NODE_ENV !== "test") main().catch(fail);
 export {

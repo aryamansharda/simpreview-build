@@ -1,5 +1,7 @@
+import { createReadStream } from 'node:fs';
 import { mkdir, readFile, rm, stat } from 'node:fs/promises';
 import path from 'node:path';
+import { Readable } from 'node:stream';
 import { api } from './api.js';
 import { fail, input, mask, notice, output } from './action-io.js';
 import { oidcToken, pullRequestContext } from './github.js';
@@ -10,16 +12,16 @@ export async function main() {
   const root = process.env.GITHUB_WORKSPACE || process.cwd();
   const scheme = input('scheme', true);
   const configuration = input('configuration') || 'Debug';
-  const derivedData = path.resolve(root, input('derived-data-path') || '.simpreview/DerivedData');
+  const derivedData = path.resolve(root, input('derived-data-path') || '.presto/DerivedData');
   const customCommand = input('build-command');
   const eventPath = process.env.GITHUB_EVENT_PATH;
   if (!eventPath) throw new Error('GitHub pull request context is unavailable.');
   const context = pullRequestContext(JSON.parse(await readFile(eventPath, 'utf8')));
 
-  const baseURL = (input('api-url') || 'https://simpreview.digitalbunker.dev').replace(/\/$/, '');
+  const baseURL = (input('api-url') || 'https://presto.digitalbunker.dev').replace(/\/$/, '');
   // Authenticate before building so the pull request comment can say "Building…" right away.
   const authenticate = async (phase: 'building' | 'none') => {
-    const identity = await oidcToken('simpreview');
+    const identity = await oidcToken('presto');
     const result = await api<{ token: string; commitSha: string; pullRequestTitle?: string }>(`${baseURL}/api/v1/auth/github-actions`, { method: 'POST', body: JSON.stringify({ oidcToken: identity, pullRequest: context.number, phase }) });
     if (result.commitSha !== context.headSHA) throw new Error('GitHub API and workflow event disagree about the pull request head commit.');
     mask(result.token);
@@ -34,18 +36,21 @@ export async function main() {
   let appPath: string; let metadata: Awaited<ReturnType<typeof inspectApp>>; let archive: string; let size: number; let sha256: string;
   try {
     await mkdir(path.dirname(derivedData), { recursive: true });
-    notice('SimPreview · Building iOS Simulator product');
+    notice('Presto · Building iOS Simulator product');
+    let buildSettingsOutput: string | undefined;
     if (customCommand) await runShell(customCommand);
     else if (!input('app-path')) {
       const container = await detectContainer(root, input('workspace'), input('project'));
-      await run('xcodebuild', [...container, '-scheme', scheme, '-configuration', configuration, '-sdk', 'iphonesimulator', '-destination', 'generic/platform=iOS Simulator', '-derivedDataPath', derivedData, 'CODE_SIGNING_ALLOWED=NO', 'build'], { cwd: root });
+      const buildArguments = [...container, '-scheme', scheme, '-configuration', configuration, '-sdk', 'iphonesimulator', '-destination', 'generic/platform=iOS Simulator', '-derivedDataPath', derivedData, 'CODE_SIGNING_ALLOWED=NO'];
+      await run('xcodebuild', [...buildArguments, 'build'], { cwd: root });
+      buildSettingsOutput = await run('xcodebuild', [...buildArguments, '-showBuildSettings', '-json'], { cwd: root, quiet: true });
     }
 
-    appPath = await findApp(derivedData, input('app-path'));
+    appPath = await findApp(derivedData, input('app-path'), buildSettingsOutput);
     metadata = await inspectApp(appPath);
-    notice(`SimPreview · Validated ${metadata.displayName} (${metadata.architectures.join(', ')})`);
+    notice(`Presto · Validated ${metadata.displayName} (${metadata.architectures.join(', ')})`);
 
-    const staging = path.resolve(root, '.simpreview');
+    const staging = path.resolve(root, '.presto');
     archive = path.join(staging, 'artifact.zip');
     await mkdir(staging, { recursive: true });
     await rm(archive, { force: true });
@@ -58,29 +63,38 @@ export async function main() {
     throw error;
   }
 
-  // The session is short-lived; take a fresh one if the build ran long.
-  if (Date.now() - authenticatedAt > 20 * 60 * 1000) { auth = await authenticate('none'); }
-  mask(auth.token);
-  const headers = { authorization: `Bearer ${auth.token}` };
-  const created = await api<{ preview: { previewId: string; status: string }; upload: { url: string } | null }>(`${baseURL}/api/v1/previews`, { method: 'POST', headers, body: JSON.stringify({ pullRequest: context.number, pullRequestTitle: auth.pullRequestTitle || context.title, commitSha: context.headSHA, branch: context.branch, scheme, configuration, ...metadata, artifactSize: size, sha256 }) });
-  if (created.preview.status !== 'ready') {
-    if (!created.upload) throw new Error('The preview is not ready and no artifact upload URL was returned.');
-    const bytes = await readFile(archive);
-    const upload = await fetch(created.upload.url, { method: 'PUT', body: bytes, headers: { 'content-type': 'application/zip' } });
-    if (!upload.ok) throw new Error(`Artifact upload failed with ${upload.status}.`);
+  try {
+    // The session is short-lived; take a fresh one if the build ran long.
+    if (Date.now() - authenticatedAt > 20 * 60 * 1000) { auth = await authenticate('none'); }
+    mask(auth.token);
+    const headers = { authorization: `Bearer ${auth.token}` };
+    const created = await api<{ preview: { previewId: string; status: string }; upload: { url: string } | null }>(`${baseURL}/api/v1/previews`, { method: 'POST', headers, body: JSON.stringify({ pullRequest: context.number, pullRequestTitle: auth.pullRequestTitle || context.title, commitSha: context.headSHA, branch: context.branch, scheme, configuration, ...metadata, artifactSize: size, sha256 }) });
+    if (created.preview.status !== 'ready') {
+      if (!created.upload) throw new Error('The preview is not ready and no artifact upload URL was returned.');
+      const upload = await fetch(created.upload.url, {
+        method: 'PUT',
+        body: Readable.toWeb(createReadStream(archive)),
+        duplex: 'half',
+        headers: { 'content-type': 'application/zip', 'content-length': String(size) },
+      } as RequestInit & { duplex: 'half' });
+      if (!upload.ok) throw new Error(`Artifact upload failed with ${upload.status}.`);
+    }
+    // Completion is intentionally idempotent so a retry can repair a missing PR
+    // comment even when the artifact became ready during an earlier attempt.
+    const completion = await fetch(`${baseURL}/api/v1/previews/${created.preview.previewId}/complete`, { method: 'POST', headers: { ...headers, accept: 'application/json' } });
+    if (!completion.ok) {
+      const body = await completion.json().catch(() => ({})) as { error?: { message?: string } };
+      throw new Error(body.error?.message || `Presto API returned ${completion.status}.`);
+    }
+    if (completion.headers.get('x-presto-comment') === 'failed') notice('::warning title=Presto::The build is ready but the pull request comment could not be updated. Check the GitHub App installation permissions.');
+    const previewURL = `${baseURL}/p/${created.preview.previewId}`;
+    await output('preview-id', created.preview.previewId);
+    await output('preview-url', previewURL);
+    notice(`Presto · Ready ${previewURL}`);
+  } catch (error) {
+    await reportFailure(error instanceof Error ? error.message : String(error));
+    throw error;
   }
-  // Completion is intentionally idempotent so a retry can repair a missing PR
-  // comment even when the artifact became ready during an earlier attempt.
-  const completion = await fetch(`${baseURL}/api/v1/previews/${created.preview.previewId}/complete`, { method: 'POST', headers: { ...headers, accept: 'application/json' } });
-  if (!completion.ok) {
-    const body = await completion.json().catch(() => ({})) as { error?: { message?: string } };
-    throw new Error(body.error?.message || `SimPreview API returned ${completion.status}.`);
-  }
-  if (completion.headers.get('x-simpreview-comment') === 'failed') notice('::warning title=SimPreview::The build is ready but the pull request comment could not be updated. Check the GitHub App installation permissions.');
-  const previewURL = `${baseURL}/p/${created.preview.previewId}`;
-  await output('preview-id', created.preview.previewId);
-  await output('preview-url', previewURL);
-  notice(`SimPreview · Ready ${previewURL}`);
 }
 
 if (process.env.NODE_ENV !== 'test') main().catch(fail);

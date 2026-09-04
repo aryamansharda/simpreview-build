@@ -15,5 +15,5 @@ export async function output(name: string, value: string) {
 
 export function mask(value: string) { process.stdout.write(`::add-mask::${value}\n`); }
 export function notice(message: string) { process.stdout.write(`${message}\n`); }
-export function fail(error: unknown) { const message = error instanceof Error ? error.message : String(error); process.stdout.write(`::error title=SimPreview::${message.replaceAll('\n', '%0A')}\n`); process.exitCode = 1; }
+export function fail(error: unknown) { const message = error instanceof Error ? error.message : String(error); process.stdout.write(`::error title=Presto::${message.replaceAll('\n', '%0A')}\n`); process.exitCode = 1; }
 

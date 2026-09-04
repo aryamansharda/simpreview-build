@@ -1,6 +1,6 @@
-name: SimPreview Build
-description: Build an iOS Simulator app and publish a private SimPreview for the current pull request.
-author: SimPreview
+name: Presto Build
+description: Build an iOS Simulator app and publish a private Presto for the current pull request.
+author: Presto
 branding:
   icon: play
   color: green
@@ -21,7 +21,7 @@ inputs:
   derived-data-path:
     description: Directory for Xcode DerivedData.
     required: false
-    default: .simpreview/DerivedData
+    default: .presto/DerivedData
   build-command:
     description: Optional complete build command for advanced projects.
     required: false
@@ -29,9 +29,9 @@ inputs:
     description: Optional path to an existing Simulator .app product.
     required: false
   api-url:
-    description: SimPreview API origin.
+    description: Presto API origin.
     required: false
-    default: https://simpreview.digitalbunker.dev
+    default: https://presto.digitalbunker.dev
 outputs:
   preview-id:
     description: Published preview identifier.

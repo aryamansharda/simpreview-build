@@ -5,7 +5,7 @@ export async function api<T extends JSONValue>(url: string, init: RequestInit = 
   if (init.body) headers.set('content-type', 'application/json');
   const response = await fetch(url, { ...init, headers });
   const body = await response.json() as T & { error?: { message?: string } };
-  if (!response.ok) throw new Error(body.error?.message || `SimPreview API returned ${response.status}.`);
+  if (!response.ok) throw new Error(body.error?.message || `Presto API returned ${response.status}.`);
   return body;
 }
 

@@ -1,19 +1,40 @@
-import { access, readdir, readFile, stat } from 'node:fs/promises';
+import { access, readdir, stat } from 'node:fs/promises';
 import path from 'node:path';
 import { run } from './process.js';
 
 export type ArtifactMetadata = { bundleId: string; displayName: string; minimumOSVersion: string; platform: 'iphonesimulator'; architectures: Array<'arm64' | 'x86_64'>; xcodeVersion: string };
 
-export async function detectContainer(root: string, workspace?: string, project?: string) {
+export async function detectContainer(root: string, workspace?: string, project?: string): Promise<readonly [string, string]> {
   if (workspace && project) throw new Error('Provide either workspace or project, not both.');
   if (workspace) return ['-workspace', workspace] as const;
   if (project) return ['-project', project] as const;
-  const entries = await readdir(root);
-  const detectedWorkspace = entries.find(name => name.endsWith('.xcworkspace'));
-  if (detectedWorkspace) return ['-workspace', detectedWorkspace] as const;
-  const detectedProject = entries.find(name => name.endsWith('.xcodeproj'));
-  if (detectedProject) return ['-project', detectedProject] as const;
+  const containers = await discoverContainers(root);
+  if (containers.workspaces.length === 1) return ['-workspace', containers.workspaces[0]!] as const;
+  if (containers.workspaces.length > 1) throw new Error(`More than one Xcode workspace was found (${containers.workspaces.join(', ')}). Set the workspace input.`);
+  if (containers.projects.length === 1) return ['-project', containers.projects[0]!] as const;
+  if (containers.projects.length > 1) throw new Error(`More than one Xcode project was found (${containers.projects.join(', ')}). Set the project input.`);
   throw new Error('No .xcworkspace or .xcodeproj was found. Set the workspace or project input.');
+}
+
+const ignoredContainerDirectories = new Set(['.git', '.build', '.presto', 'build', 'Carthage', 'DerivedData', 'node_modules', 'Pods']);
+
+async function discoverContainers(root: string) {
+  const workspaces: string[] = [];
+  const projects: string[] = [];
+  async function walk(directory: string, depth: number) {
+    if (depth > 4) return;
+    const entries = await readdir(directory, { withFileTypes: true });
+    for (const entry of entries) {
+      if (!entry.isDirectory() || ignoredContainerDirectories.has(entry.name)) continue;
+      const absolute = path.join(directory, entry.name);
+      const relative = path.relative(root, absolute);
+      if (entry.name.endsWith('.xcworkspace')) workspaces.push(relative);
+      else if (entry.name.endsWith('.xcodeproj')) projects.push(relative);
+      else await walk(absolute, depth + 1);
+    }
+  }
+  await walk(root, 0);
+  return { workspaces: workspaces.sort(), projects: projects.sort() };
 }
 
 export function parseBuildSettings(output: string): { targetBuildDir?: string; wrapperName?: string } {
@@ -22,14 +43,45 @@ export function parseBuildSettings(output: string): { targetBuildDir?: string; w
   return { targetBuildDir: values.TARGET_BUILD_DIR, wrapperName: values.WRAPPER_NAME };
 }
 
-export async function findApp(derivedData: string, explicit?: string): Promise<string> {
+type XcodeBuildSettingsEntry = {
+  target?: string;
+  buildSettings?: Record<string, string>;
+};
+
+export function simulatorAppPathsFromBuildSettings(output: string): string[] {
+  let entries: XcodeBuildSettingsEntry[];
+  try {
+    entries = JSON.parse(output) as XcodeBuildSettingsEntry[];
+  } catch {
+    throw new Error('Xcode returned unreadable build settings. Set the app-path input to the Simulator .app product.');
+  }
+  if (!Array.isArray(entries)) throw new Error('Xcode returned unreadable build settings. Set the app-path input to the Simulator .app product.');
+  return entries.flatMap(({ buildSettings = {} }) => {
+    if (buildSettings.PRODUCT_TYPE !== 'com.apple.product-type.application' || buildSettings.PLATFORM_NAME !== 'iphonesimulator') return [];
+    const directory = buildSettings.TARGET_BUILD_DIR;
+    const wrapper = buildSettings.WRAPPER_NAME;
+    return directory && wrapper ? [path.join(directory, wrapper)] : [];
+  });
+}
+
+export async function findApp(derivedData: string, explicit?: string, buildSettingsOutput?: string): Promise<string> {
   if (explicit) { await access(explicit); return path.resolve(explicit); }
+  if (buildSettingsOutput) {
+    const candidates = [...new Set(simulatorAppPathsFromBuildSettings(buildSettingsOutput))];
+    if (candidates.length > 1) throw new Error(`The scheme builds more than one iOS app (${candidates.map(candidate => path.basename(candidate)).join(', ')}). Set the app-path input to the app reviewers should run.`);
+    if (candidates[0]) {
+      await access(candidates[0]);
+      return candidates[0];
+    }
+    throw new Error('The selected scheme did not produce an iOS Simulator app. Set the scheme or app-path input.');
+  }
   const products = path.join(derivedData, 'Build', 'Products');
   const found: Array<{ file: string; modified: number }> = [];
   async function walk(directory: string) { for (const entry of await readdir(directory, { withFileTypes: true })) { const file = path.join(directory, entry.name); if (entry.isDirectory() && entry.name.endsWith('.app')) found.push({ file, modified: (await stat(file)).mtimeMs }); else if (entry.isDirectory()) await walk(file); } }
   await walk(products);
   found.sort((a, b) => b.modified - a.modified);
   if (!found[0]) throw new Error('Xcode completed but no .app product was found in DerivedData.');
+  if (found.length > 1) throw new Error(`More than one .app product was found (${found.map(candidate => path.basename(candidate.file)).join(', ')}). Set the app-path input to the app reviewers should run.`);
   return found[0].file;
 }
 
@@ -49,4 +101,3 @@ export async function inspectApp(appPath: string): Promise<ArtifactMetadata> {
 
 function requiredString(plist: Record<string, unknown>, key: string) { const value = optionalString(plist, key); if (!value) throw new Error(`Built app is missing ${key} in Info.plist.`); return value; }
 function optionalString(plist: Record<string, unknown>, key: string) { return typeof plist[key] === 'string' ? plist[key] as string : ''; }
-

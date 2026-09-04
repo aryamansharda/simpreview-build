@@ -1,5 +1,5 @@
 {
-  "name": "simpreview-build-action",
+  "name": "presto-build-action",
   "version": "0.1.0",
   "private": true,
   "type": "module",

@@ -3,7 +3,7 @@ export function pullRequestContext(event: unknown): { number: number; title?: st
   const number = root.pull_request?.number ?? root.number;
   const branch = root.pull_request?.head?.ref;
   const headSHA = root.pull_request?.head?.sha;
-  if (!number || !branch || !headSHA || !/^[0-9a-f]{40}$/.test(headSHA)) throw new Error('SimPreview must run from a pull_request workflow event.');
+  if (!number || !branch || !headSHA || !/^[0-9a-f]{40}$/.test(headSHA)) throw new Error('Presto must run from a pull_request workflow event.');
   return { number, title: root.pull_request?.title, branch, headSHA };
 }
 

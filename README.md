@@ -1,4 +1,4 @@
-# SimPreview build action
+# Presto build action
 
 ```yaml
 permissions:
@@ -8,7 +8,7 @@ permissions:
 
 steps:
   - uses: actions/checkout@v5
-  - uses: aryamansharda/simpreview-build@v1
+  - uses: aryamansharda/presto-build@v1
     with:
       scheme: MyApp
 ```
