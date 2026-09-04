@@ -1,10 +1,13 @@
-export function pullRequestContext(event: unknown): { number: number; title?: string; branch: string; headSHA: string } {
-  const root = event as { pull_request?: { number?: number; title?: string; head?: { ref?: string; sha?: string } }; number?: number };
+export function pullRequestContext(event: unknown): { number: number; title?: string; branch: string; headSHA: string; fromFork: boolean } {
+  const root = event as { pull_request?: { number?: number; title?: string; head?: { ref?: string; sha?: string; repo?: { fork?: boolean; full_name?: string } }; base?: { repo?: { full_name?: string } } }; number?: number };
   const number = root.pull_request?.number ?? root.number;
   const branch = root.pull_request?.head?.ref;
   const headSHA = root.pull_request?.head?.sha;
   if (!number || !branch || !headSHA || !/^[0-9a-f]{40}$/.test(headSHA)) throw new Error('Presto must run from a pull_request workflow event.');
-  return { number, title: root.pull_request?.title, branch, headSHA };
+  const headRepo = root.pull_request?.head?.repo?.full_name;
+  const baseRepo = root.pull_request?.base?.repo?.full_name;
+  const fromFork = Boolean(root.pull_request?.head?.repo?.fork) || (Boolean(headRepo && baseRepo) && headRepo !== baseRepo);
+  return { number, title: root.pull_request?.title, branch, headSHA, fromFork };
 }
 
 export async function oidcToken(audience: string): Promise<string> {

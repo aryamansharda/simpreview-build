@@ -17,6 +17,11 @@ export async function main() {
   const eventPath = process.env.GITHUB_EVENT_PATH;
   if (!eventPath) throw new Error('GitHub pull request context is unavailable.');
   const context = pullRequestContext(JSON.parse(await readFile(eventPath, 'utf8')));
+  if (context.fromFork) {
+    // Fork PRs get no OIDC identity, and their code should not be published under this repo's name anyway.
+    notice('::notice title=Presto::Skipped: pull requests from forks are not built. Push a branch in this repository to get a Run button.');
+    return;
+  }
 
   const baseURL = (input('api-url') || 'https://presto.digitalbunker.dev').replace(/\/$/, '');
   // Authenticate before building so the pull request comment can say "Building…" right away.
@@ -41,7 +46,8 @@ export async function main() {
     if (customCommand) await runShell(customCommand);
     else if (!input('app-path')) {
       const container = await detectContainer(root, input('workspace'), input('project'));
-      const buildArguments = [...container, '-scheme', scheme, '-configuration', configuration, '-sdk', 'iphonesimulator', '-destination', 'generic/platform=iOS Simulator', '-derivedDataPath', derivedData, 'CODE_SIGNING_ALLOWED=NO'];
+      // ONLY_ACTIVE_ARCH=NO: Debug builds default to the runner's arch only, which leaves Intel Macs unable to run the app.
+      const buildArguments = [...container, '-scheme', scheme, '-configuration', configuration, '-sdk', 'iphonesimulator', '-destination', 'generic/platform=iOS Simulator', '-derivedDataPath', derivedData, 'CODE_SIGNING_ALLOWED=NO', 'ONLY_ACTIVE_ARCH=NO'];
       await run('xcodebuild', [...buildArguments, 'build'], { cwd: root });
       buildSettingsOutput = await run('xcodebuild', [...buildArguments, '-showBuildSettings', '-json'], { cwd: root, quiet: true });
     }
@@ -79,9 +85,11 @@ export async function main() {
       } as RequestInit & { duplex: 'half' });
       if (!upload.ok) throw new Error(`Artifact upload failed with ${upload.status}.`);
     }
+    // A slow upload can outlive the session; take a fresh one before completing.
+    if (Date.now() - authenticatedAt > 20 * 60 * 1000) { auth = await authenticate('none'); mask(auth.token); }
     // Completion is intentionally idempotent so a retry can repair a missing PR
     // comment even when the artifact became ready during an earlier attempt.
-    const completion = await fetch(`${baseURL}/api/v1/previews/${created.preview.previewId}/complete`, { method: 'POST', headers: { ...headers, accept: 'application/json' } });
+    const completion = await fetch(`${baseURL}/api/v1/previews/${created.preview.previewId}/complete`, { method: 'POST', headers: { authorization: `Bearer ${auth.token}`, accept: 'application/json' } });
     if (!completion.ok) {
       const body = await completion.json().catch(() => ({})) as { error?: { message?: string } };
       throw new Error(body.error?.message || `Presto API returned ${completion.status}.`);

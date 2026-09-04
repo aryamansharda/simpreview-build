@@ -53,7 +53,10 @@ function pullRequestContext(event) {
   const branch = root.pull_request?.head?.ref;
   const headSHA = root.pull_request?.head?.sha;
   if (!number || !branch || !headSHA || !/^[0-9a-f]{40}$/.test(headSHA)) throw new Error("Presto must run from a pull_request workflow event.");
-  return { number, title: root.pull_request?.title, branch, headSHA };
+  const headRepo = root.pull_request?.head?.repo?.full_name;
+  const baseRepo = root.pull_request?.base?.repo?.full_name;
+  const fromFork = Boolean(root.pull_request?.head?.repo?.fork) || Boolean(headRepo && baseRepo) && headRepo !== baseRepo;
+  return { number, title: root.pull_request?.title, branch, headSHA, fromFork };
 }
 async function oidcToken(audience) {
   const endpoint = process.env.ACTIONS_ID_TOKEN_REQUEST_URL;
@@ -204,6 +207,10 @@ async function main() {
   const eventPath = process.env.GITHUB_EVENT_PATH;
   if (!eventPath) throw new Error("GitHub pull request context is unavailable.");
   const context = pullRequestContext(JSON.parse(await readFile(eventPath, "utf8")));
+  if (context.fromFork) {
+    notice("::notice title=Presto::Skipped: pull requests from forks are not built. Push a branch in this repository to get a Run button.");
+    return;
+  }
   const baseURL = (input("api-url") || "https://presto.digitalbunker.dev").replace(/\/$/, "");
   const authenticate = async (phase) => {
     const identity = await oidcToken("presto");
@@ -229,7 +236,7 @@ async function main() {
     if (customCommand) await runShell(customCommand);
     else if (!input("app-path")) {
       const container = await detectContainer(root, input("workspace"), input("project"));
-      const buildArguments = [...container, "-scheme", scheme, "-configuration", configuration, "-sdk", "iphonesimulator", "-destination", "generic/platform=iOS Simulator", "-derivedDataPath", derivedData, "CODE_SIGNING_ALLOWED=NO"];
+      const buildArguments = [...container, "-scheme", scheme, "-configuration", configuration, "-sdk", "iphonesimulator", "-destination", "generic/platform=iOS Simulator", "-derivedDataPath", derivedData, "CODE_SIGNING_ALLOWED=NO", "ONLY_ACTIVE_ARCH=NO"];
       await run("xcodebuild", [...buildArguments, "build"], { cwd: root });
       buildSettingsOutput = await run("xcodebuild", [...buildArguments, "-showBuildSettings", "-json"], { cwd: root, quiet: true });
     }
@@ -265,7 +272,11 @@ async function main() {
       });
       if (!upload.ok) throw new Error(`Artifact upload failed with ${upload.status}.`);
     }
-    const completion = await fetch(`${baseURL}/api/v1/previews/${created.preview.previewId}/complete`, { method: "POST", headers: { ...headers, accept: "application/json" } });
+    if (Date.now() - authenticatedAt > 20 * 60 * 1e3) {
+      auth = await authenticate("none");
+      mask(auth.token);
+    }
+    const completion = await fetch(`${baseURL}/api/v1/previews/${created.preview.previewId}/complete`, { method: "POST", headers: { authorization: `Bearer ${auth.token}`, accept: "application/json" } });
     if (!completion.ok) {
       const body = await completion.json().catch(() => ({}));
       throw new Error(body.error?.message || `Presto API returned ${completion.status}.`);
