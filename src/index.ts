@@ -10,7 +10,7 @@ import { actionAuthenticationPayload, type ActionAuthenticationPhase } from './a
 import { actionableBuildFailure } from './build-diagnostics.js';
 import { oidcToken, pullRequestContext } from './github.js';
 import { startWorkflowHeartbeat } from './heartbeat.js';
-import { detectContainer, findApp, inspectApp } from './inspect.js';
+import { detectContainer, findApp, inspectApp, needsDefaultBuild, verifyPullRequestCheckout } from './inspect.js';
 import { run, runShell } from './process.js';
 
 export async function main() {
@@ -30,6 +30,11 @@ export async function main() {
     notice('::notice title=Presto::Skipped: pull requests from forks are not built. Push a branch in this repository to get a Run button.');
     await saveState('PRESTO_FINALIZED', 'true');
     return;
+  }
+
+  const checkoutVerified = await verifyPullRequestCheckout(root, context.headSHA);
+  if (!checkoutVerified) {
+    notice('::warning title=Presto could not verify the source commit::This job has no Git checkout. Presto assumes the app-path product came from the current pull request head.');
   }
 
   const baseURL = (input('api-url') || 'https://presto.digitalbunker.dev').replace(/\/$/, '');
@@ -77,8 +82,10 @@ export async function main() {
     await mkdir(path.dirname(derivedData), { recursive: true });
     notice('Presto · Building iOS Simulator product');
     let buildSettingsOutput: string | undefined;
+    const appPathInput = input('app-path');
+    const requestedAppPath = appPathInput ? path.resolve(root, appPathInput) : undefined;
     if (customCommand) await runShell(customCommand);
-    else if (!input('app-path')) {
+    else if (await needsDefaultBuild(requestedAppPath)) {
       const container = await detectContainer(root, input('workspace'), input('project'));
       // ONLY_ACTIVE_ARCH=NO: Debug builds default to the runner's arch only, which leaves Intel Macs unable to run the app.
       const buildArguments = [...container, '-scheme', scheme, '-configuration', configuration, '-sdk', 'iphonesimulator', '-destination', 'generic/platform=iOS Simulator', '-derivedDataPath', derivedData, 'CODE_SIGNING_ALLOWED=NO', 'ONLY_ACTIVE_ARCH=NO'];
@@ -86,7 +93,7 @@ export async function main() {
       buildSettingsOutput = await run('xcodebuild', [...buildArguments, '-showBuildSettings', '-json'], { cwd: root, quiet: true });
     }
 
-    appPath = await findApp(derivedData, input('app-path'), buildSettingsOutput);
+    appPath = await findApp(derivedData, requestedAppPath, buildSettingsOutput);
     metadata = await inspectApp(appPath);
     notice(`Presto · Validated ${metadata.displayName} (${metadata.architectures.join(', ')})`);
 

@@ -26,7 +26,7 @@ inputs:
     description: Optional complete build command for advanced projects.
     required: false
   app-path:
-    description: Optional path to an existing Simulator .app product.
+    description: Optional path to the Simulator .app to publish. Existing products are reused; otherwise the default build runs first.
     required: false
   api-url:
     description: Presto API origin.

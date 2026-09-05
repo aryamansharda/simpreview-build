@@ -194,7 +194,7 @@ function pullRequestContext(event) {
   if (!number || !branch || !headSHA || !/^[0-9a-f]{40}$/.test(headSHA)) throw new Error("Presto must run from a pull_request workflow event.");
   const headRepo = root.pull_request?.head?.repo?.full_name;
   const baseRepo = root.pull_request?.base?.repo?.full_name;
-  const fromFork = Boolean(root.pull_request?.head?.repo?.fork) || Boolean(headRepo && baseRepo) && headRepo !== baseRepo;
+  const fromFork = headRepo && baseRepo ? headRepo !== baseRepo : Boolean(root.pull_request?.head?.repo?.fork);
   return { number, title: root.pull_request?.title, branch, headSHA, fromFork };
 }
 async function oidcToken(audience) {
@@ -245,6 +245,20 @@ async function detectContainer(root, workspace, project) {
   if (containers.projects.length === 1) return ["-project", containers.projects[0]];
   if (containers.projects.length > 1) throw new Error(`More than one Xcode project was found (${containers.projects.join(", ")}). Set the project input.`);
   throw new Error("No .xcworkspace or .xcodeproj was found. Set the workspace or project input.");
+}
+async function verifyPullRequestCheckout(root, expectedHeadSHA) {
+  try {
+    await access(path.join(root, ".git"));
+  } catch {
+    return false;
+  }
+  const checkedOutSHA = (await run("git", ["-C", root, "rev-parse", "HEAD"], { quiet: true })).trim();
+  if (checkedOutSHA !== expectedHeadSHA) {
+    throw new Error(
+      "The checked-out commit does not match this pull request. Configure actions/checkout with `ref: ${{ github.event.pull_request.head.sha }}` before the Presto step."
+    );
+  }
+  return true;
 }
 var ignoredContainerDirectories = /* @__PURE__ */ new Set([".git", ".build", ".presto", "build", "Carthage", "DerivedData", "node_modules", "Pods"]);
 async function discoverContainers(root) {
@@ -309,6 +323,15 @@ async function findApp(derivedData, explicit, buildSettingsOutput) {
   if (found.length > 1) throw new Error(`More than one .app product was found (${found.map((candidate) => path.basename(candidate.file)).join(", ")}). Set the app-path input to the app reviewers should run.`);
   return found[0].file;
 }
+async function needsDefaultBuild(explicitAppPath) {
+  if (!explicitAppPath) return true;
+  try {
+    await access(explicitAppPath);
+    return false;
+  } catch {
+    return true;
+  }
+}
 async function inspectApp(appPath) {
   const plistPath = path.join(appPath, "Info.plist");
   const json = await run("plutil", ["-convert", "json", "-o", "-", plistPath], { quiet: true });
@@ -348,6 +371,10 @@ async function main() {
     notice("::notice title=Presto::Skipped: pull requests from forks are not built. Push a branch in this repository to get a Run button.");
     await saveState("PRESTO_FINALIZED", "true");
     return;
+  }
+  const checkoutVerified = await verifyPullRequestCheckout(root, context.headSHA);
+  if (!checkoutVerified) {
+    notice("::warning title=Presto could not verify the source commit::This job has no Git checkout. Presto assumes the app-path product came from the current pull request head.");
   }
   const baseURL = (input("api-url") || "https://presto.digitalbunker.dev").replace(/\/$/, "");
   const authenticate = async (phase) => {
@@ -396,14 +423,16 @@ async function main() {
     await mkdir(path2.dirname(derivedData), { recursive: true });
     notice("Presto \xB7 Building iOS Simulator product");
     let buildSettingsOutput;
+    const appPathInput = input("app-path");
+    const requestedAppPath = appPathInput ? path2.resolve(root, appPathInput) : void 0;
     if (customCommand) await runShell(customCommand);
-    else if (!input("app-path")) {
+    else if (await needsDefaultBuild(requestedAppPath)) {
       const container = await detectContainer(root, input("workspace"), input("project"));
       const buildArguments = [...container, "-scheme", scheme, "-configuration", configuration, "-sdk", "iphonesimulator", "-destination", "generic/platform=iOS Simulator", "-derivedDataPath", derivedData, "CODE_SIGNING_ALLOWED=NO", "ONLY_ACTIVE_ARCH=NO"];
       await run("xcodebuild", [...buildArguments, "build"], { cwd: root });
       buildSettingsOutput = await run("xcodebuild", [...buildArguments, "-showBuildSettings", "-json"], { cwd: root, quiet: true });
     }
-    appPath = await findApp(derivedData, input("app-path"), buildSettingsOutput);
+    appPath = await findApp(derivedData, requestedAppPath, buildSettingsOutput);
     metadata = await inspectApp(appPath);
     notice(`Presto \xB7 Validated ${metadata.displayName} (${metadata.architectures.join(", ")})`);
     const staging = path2.resolve(root, ".presto");

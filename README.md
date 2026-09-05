@@ -8,12 +8,16 @@ permissions:
 
 steps:
   - uses: actions/checkout@v5
+    with:
+      ref: ${{ github.event.pull_request.head.sha }}
   - uses: aryamansharda/presto-build@v1
     with:
       scheme: MyApp
 ```
 
 The action builds an unsigned `iphonesimulator` product, validates its bundle metadata and architectures, packages it, authenticates with GitHub OIDC, uploads directly to private storage, and completes the preview. If GitHub cancels or times out the action before it finishes, the post-run hook replaces the stale Preparing comment with the failure state whenever the runner still has time to perform cleanup.
+
+If one scheme produces more than one iOS app, set `app-path` to the app reviewers should run. On a clean runner, Presto performs the normal build and selects that product. If an earlier CI step already created the app at that path, Presto reuses it without compiling again.
 
 ## Use your project’s Xcode version
 
@@ -22,6 +26,8 @@ Presto uses the Xcode version already selected in the job. Because the default o
 ```yaml
 steps:
   - uses: actions/checkout@v5
+    with:
+      ref: ${{ github.event.pull_request.head.sha }}
   - name: Select Xcode 16.4
     run: |
       sudo xcode-select -s /Applications/Xcode_16.4.app

@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import { detectContainer, findApp, parseBuildSettings, simulatorAppPathsFromBuildSettings } from '../src/inspect.js';
+import { detectContainer, findApp, needsDefaultBuild, parseBuildSettings, simulatorAppPathsFromBuildSettings, verifyPullRequestCheckout } from '../src/inspect.js';
 import { pullRequestContext } from '../src/github.js';
 import { run } from '../src/process.js';
 
@@ -12,6 +12,7 @@ test('pullRequestContext reads canonical pull request metadata', () => { assert.
 test('pullRequestContext flags pull requests from forks', () => {
   assert.equal(pullRequestContext({ number: 7, pull_request: { head: { ref: 'x', sha: headSHA, repo: { fork: true, full_name: 'someone/app' } }, base: { repo: { full_name: 'acme/app' } } } }).fromFork, true);
   assert.equal(pullRequestContext({ number: 7, pull_request: { head: { ref: 'x', sha: headSHA, repo: { fork: false, full_name: 'acme/app' } }, base: { repo: { full_name: 'acme/app' } } } }).fromFork, false);
+  assert.equal(pullRequestContext({ number: 7, pull_request: { head: { ref: 'x', sha: headSHA, repo: { fork: true, full_name: 'acme/app' } }, base: { repo: { full_name: 'acme/app' } } } }).fromFork, false, 'a forked repository can receive safe PRs from its own branches');
 });
 test('pullRequestContext rejects non-PR events', () => { assert.throws(() => pullRequestContext({ ref: 'main' }), /pull_request/); });
 test('parseBuildSettings extracts paths without scraping fixed spacing', () => { assert.deepEqual(parseBuildSettings('    TARGET_BUILD_DIR = /tmp/Build Products/Debug\n    WRAPPER_NAME = MyApp.app\n'), { targetBuildDir: '/tmp/Build Products/Debug', wrapperName: 'MyApp.app' }); });
@@ -24,6 +25,49 @@ test('process failures never copy command stderr into the surfaced error', async
       && error.message === '/bin/sh exited with 7. Review the Actions log for details.'
       && !error.message.includes(secret),
   );
+});
+
+test('verifyPullRequestCheckout accepts the exact pull request head', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'presto-checkout-'));
+  try {
+    await run('git', ['init', '--quiet', root], { quiet: true });
+    await run('git', ['-C', root, 'config', 'user.email', 'presto@example.com'], { quiet: true });
+    await run('git', ['-C', root, 'config', 'user.name', 'Presto Test'], { quiet: true });
+    await writeFile(path.join(root, 'README.md'), 'fixture');
+    await run('git', ['-C', root, 'add', 'README.md'], { quiet: true });
+    await run('git', ['-C', root, 'commit', '--quiet', '-m', 'Fixture'], { quiet: true });
+    const head = (await run('git', ['-C', root, 'rev-parse', 'HEAD'], { quiet: true })).trim();
+    assert.equal(await verifyPullRequestCheckout(root, head), true);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('verifyPullRequestCheckout rejects a synthetic merge or stale checkout', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'presto-checkout-'));
+  try {
+    await run('git', ['init', '--quiet', root], { quiet: true });
+    await run('git', ['-C', root, 'config', 'user.email', 'presto@example.com'], { quiet: true });
+    await run('git', ['-C', root, 'config', 'user.name', 'Presto Test'], { quiet: true });
+    await writeFile(path.join(root, 'README.md'), 'fixture');
+    await run('git', ['-C', root, 'add', 'README.md'], { quiet: true });
+    await run('git', ['-C', root, 'commit', '--quiet', '-m', 'Fixture'], { quiet: true });
+    await assert.rejects(
+      verifyPullRequestCheckout(root, 'a'.repeat(40)),
+      /ref: \$\{\{ github\.event\.pull_request\.head\.sha \}\}/,
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('verifyPullRequestCheckout reports when a downloaded artifact job has no checkout', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'presto-checkout-'));
+  try {
+    assert.equal(await verifyPullRequestCheckout(root, headSHA), false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test('detectContainer finds a single iOS workspace in a monorepo', async () => {
@@ -79,6 +123,18 @@ test('findApp requires app-path when a custom build leaves multiple app products
     await mkdir(path.join(root, 'Build', 'Products', 'Debug-iphonesimulator', 'Consumer.app'), { recursive: true });
     await mkdir(path.join(root, 'Build', 'Products', 'Debug-iphonesimulator', 'Enterprise.app'), { recursive: true });
     await assert.rejects(findApp(root), /More than one \.app product/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('an app-path selects the desired built-in build product without skipping a required build', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'presto-products-'));
+  const requested = path.join(root, 'Build', 'Products', 'Debug-iphonesimulator', 'Consumer.app');
+  try {
+    assert.equal(await needsDefaultBuild(requested), true, 'a clean runner still needs to build the selected app');
+    await mkdir(requested, { recursive: true });
+    assert.equal(await needsDefaultBuild(requested), false, 'an app produced by existing CI is reused');
   } finally {
     await rm(root, { recursive: true, force: true });
   }

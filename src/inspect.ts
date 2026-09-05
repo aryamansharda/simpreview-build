@@ -16,6 +16,30 @@ export async function detectContainer(root: string, workspace?: string, project?
   throw new Error('No .xcworkspace or .xcodeproj was found. Set the workspace or project input.');
 }
 
+/**
+ * GitHub checks out a synthetic merge commit by default for pull_request jobs.
+ * Presto identifies previews by the pull request head SHA, so publishing that
+ * merge product under the head SHA would make the Run button misleading.
+ *
+ * A job that only downloads an already-built app may not have a checkout at
+ * all; in that case there is no local Git state for this action to verify.
+ */
+export async function verifyPullRequestCheckout(root: string, expectedHeadSHA: string): Promise<boolean> {
+  try {
+    await access(path.join(root, '.git'));
+  } catch {
+    return false;
+  }
+
+  const checkedOutSHA = (await run('git', ['-C', root, 'rev-parse', 'HEAD'], { quiet: true })).trim();
+  if (checkedOutSHA !== expectedHeadSHA) {
+    throw new Error(
+      'The checked-out commit does not match this pull request. Configure actions/checkout with `ref: ${{ github.event.pull_request.head.sha }}` before the Presto step.',
+    );
+  }
+  return true;
+}
+
 const ignoredContainerDirectories = new Set(['.git', '.build', '.presto', 'build', 'Carthage', 'DerivedData', 'node_modules', 'Pods']);
 
 async function discoverContainers(root: string) {
@@ -83,6 +107,17 @@ export async function findApp(derivedData: string, explicit?: string, buildSetti
   if (!found[0]) throw new Error('Xcode completed but no .app product was found in DerivedData.');
   if (found.length > 1) throw new Error(`More than one .app product was found (${found.map(candidate => path.basename(candidate.file)).join(', ')}). Set the app-path input to the app reviewers should run.`);
   return found[0].file;
+}
+
+/** Reuse an app that CI already produced; otherwise let the default builder create it. */
+export async function needsDefaultBuild(explicitAppPath?: string): Promise<boolean> {
+  if (!explicitAppPath) return true;
+  try {
+    await access(explicitAppPath);
+    return false;
+  } catch {
+    return true;
+  }
 }
 
 export async function inspectApp(appPath: string): Promise<ArtifactMetadata> {

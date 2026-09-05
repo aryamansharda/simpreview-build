@@ -6,7 +6,12 @@ export function pullRequestContext(event: unknown): { number: number; title?: st
   if (!number || !branch || !headSHA || !/^[0-9a-f]{40}$/.test(headSHA)) throw new Error('Presto must run from a pull_request workflow event.');
   const headRepo = root.pull_request?.head?.repo?.full_name;
   const baseRepo = root.pull_request?.base?.repo?.full_name;
-  const fromFork = Boolean(root.pull_request?.head?.repo?.fork) || (Boolean(headRepo && baseRepo) && headRepo !== baseRepo);
+  // `repo.fork` describes the repository itself, not whether this pull request
+  // crosses repositories. A repository fork can still receive safe same-repo
+  // pull requests from its own branches.
+  const fromFork = headRepo && baseRepo
+    ? headRepo !== baseRepo
+    : Boolean(root.pull_request?.head?.repo?.fork);
   return { number, title: root.pull_request?.title, branch, headSHA, fromFork };
 }
 
