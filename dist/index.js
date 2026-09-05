@@ -1,7 +1,8 @@
 import { createRequire as __createRequire } from "module";const require=__createRequire(import.meta.url);
 
 // src/index.ts
-import { createReadStream } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { createReadStream as createReadStream2 } from "node:fs";
 import { mkdir, readFile, rm, stat as stat2 } from "node:fs/promises";
 import path2 from "node:path";
 import { Readable } from "node:stream";
@@ -46,6 +47,19 @@ function fail(error) {
   process.exitCode = 1;
 }
 
+// src/digests.ts
+import { createHash } from "node:crypto";
+import { createReadStream } from "node:fs";
+async function artifactDigests(file) {
+  const sha256 = createHash("sha256");
+  const md5 = createHash("md5");
+  for await (const chunk of createReadStream(file)) {
+    sha256.update(chunk);
+    md5.update(chunk);
+  }
+  return { sha256: sha256.digest("hex"), md5: md5.digest("hex") };
+}
+
 // src/github.ts
 function pullRequestContext(event) {
   const root = event;
@@ -80,20 +94,16 @@ async function run(command, args, options = {}) {
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, { cwd: options.cwd, env: process.env, stdio: ["ignore", "pipe", "pipe"] });
     let stdout = "";
-    let stderr = "";
     child.stdout.on("data", (chunk) => {
       const text = chunk.toString();
       stdout += text;
       if (!options.quiet) process.stdout.write(text);
     });
     child.stderr.on("data", (chunk) => {
-      const text = chunk.toString();
-      stderr += text;
-      if (!options.quiet) process.stderr.write(text);
+      if (!options.quiet) process.stderr.write(chunk);
     });
     child.on("error", reject);
-    child.on("close", (code) => code === 0 ? resolve(stdout) : reject(new Error(`${command} exited with ${code}.
-${stderr.slice(-4e3)}`)));
+    child.on("close", (code) => code === 0 ? resolve(stdout) : reject(new Error(`${command} exited with ${code}. Review the Actions log for details.`)));
   });
 }
 async function runShell(script) {
@@ -207,6 +217,7 @@ async function main() {
   const eventPath = process.env.GITHUB_EVENT_PATH;
   if (!eventPath) throw new Error("GitHub pull request context is unavailable.");
   const context = pullRequestContext(JSON.parse(await readFile(eventPath, "utf8")));
+  const publishAttemptId = randomUUID();
   if (context.fromFork) {
     notice("::notice title=Presto::Skipped: pull requests from forks are not built. Push a branch in this repository to get a Run button.");
     return;
@@ -214,21 +225,36 @@ async function main() {
   const baseURL = (input("api-url") || "https://presto.digitalbunker.dev").replace(/\/$/, "");
   const authenticate = async (phase) => {
     const identity = await oidcToken("presto");
-    const result = await api(`${baseURL}/api/v1/auth/github-actions`, { method: "POST", body: JSON.stringify({ oidcToken: identity, pullRequest: context.number, phase }) });
+    const result = await api(`${baseURL}/api/v1/auth/github-actions`, { method: "POST", body: JSON.stringify({ oidcToken: identity, pullRequest: context.number, expectedHeadSha: context.headSHA, phase }) });
     if (result.commitSha !== context.headSHA) throw new Error("GitHub API and workflow event disagree about the pull request head commit.");
     mask(result.token);
     return result;
   };
   let auth = await authenticate("building");
-  const authenticatedAt = Date.now();
-  const reportFailure = async (detail) => {
-    await fetch(`${baseURL}/api/v1/workflow/status`, { method: "POST", headers: { authorization: `Bearer ${auth.token}`, "content-type": "application/json" }, body: JSON.stringify({ phase: "failed", detail }) }).catch(() => void 0);
+  let authenticatedAt = Date.now();
+  const refreshAuthentication = async (force = false) => {
+    if (!force && Date.now() - authenticatedAt <= 20 * 60 * 1e3) return;
+    auth = await authenticate("none");
+    authenticatedAt = Date.now();
+  };
+  const reportFailure = async (stage, previewId) => {
+    try {
+      await refreshAuthentication();
+      const send = () => fetch(`${baseURL}/api/v1/workflow/status`, { method: "POST", headers: { authorization: `Bearer ${auth.token}`, "content-type": "application/json" }, body: JSON.stringify({ phase: "failed", stage, previewId }) });
+      let response = await send();
+      if (response.status === 401) {
+        await refreshAuthentication(true);
+        response = await send();
+      }
+    } catch {
+    }
   };
   let appPath;
   let metadata;
   let archive;
   let size;
   let sha256;
+  let md5;
   try {
     await mkdir(path2.dirname(derivedData), { recursive: true });
     notice("Presto \xB7 Building iOS Simulator product");
@@ -249,34 +275,36 @@ async function main() {
     await rm(archive, { force: true });
     await run("ditto", ["-c", "-k", "--sequesterRsrc", "--keepParent", appPath, archive], { quiet: true });
     size = (await stat2(archive)).size;
-    sha256 = (await run("shasum", ["-a", "256", archive], { quiet: true })).trim().split(/\s+/)[0] ?? "";
-    if (!sha256) throw new Error("Could not calculate artifact checksum.");
+    ({ sha256, md5 } = await artifactDigests(archive));
   } catch (error) {
-    await reportFailure(error instanceof Error ? error.message : String(error));
+    await reportFailure("build");
     throw error;
   }
+  let createdPreviewId;
   try {
-    if (Date.now() - authenticatedAt > 20 * 60 * 1e3) {
-      auth = await authenticate("none");
-    }
+    await refreshAuthentication();
     mask(auth.token);
     const headers = { authorization: `Bearer ${auth.token}` };
-    const created = await api(`${baseURL}/api/v1/previews`, { method: "POST", headers, body: JSON.stringify({ pullRequest: context.number, pullRequestTitle: auth.pullRequestTitle || context.title, commitSha: context.headSHA, branch: context.branch, scheme, configuration, ...metadata, artifactSize: size, sha256 }) });
+    const created = await api(`${baseURL}/api/v1/previews`, { method: "POST", headers, body: JSON.stringify({ publishAttemptId, pullRequest: context.number, pullRequestTitle: auth.pullRequestTitle || context.title, commitSha: context.headSHA, branch: context.branch, scheme, configuration, ...metadata, artifactSize: size, sha256, md5 }) });
+    createdPreviewId = created.preview.previewId;
     if (created.preview.status !== "ready") {
       if (!created.upload) throw new Error("The preview is not ready and no artifact upload URL was returned.");
       const upload = await fetch(created.upload.url, {
         method: "PUT",
-        body: Readable.toWeb(createReadStream(archive)),
+        body: Readable.toWeb(createReadStream2(archive)),
         duplex: "half",
-        headers: { "content-type": "application/zip", "content-length": String(size) }
+        headers: { ...created.upload.headers, "content-type": "application/zip", "content-length": String(size) }
       });
       if (!upload.ok) throw new Error(`Artifact upload failed with ${upload.status}.`);
     }
-    if (Date.now() - authenticatedAt > 20 * 60 * 1e3) {
-      auth = await authenticate("none");
-      mask(auth.token);
+    await refreshAuthentication();
+    mask(auth.token);
+    const complete = () => fetch(`${baseURL}/api/v1/previews/${created.preview.previewId}/complete`, { method: "POST", headers: { authorization: `Bearer ${auth.token}`, accept: "application/json" } });
+    let completion = await complete();
+    if (completion.status === 401) {
+      await refreshAuthentication(true);
+      completion = await complete();
     }
-    const completion = await fetch(`${baseURL}/api/v1/previews/${created.preview.previewId}/complete`, { method: "POST", headers: { authorization: `Bearer ${auth.token}`, accept: "application/json" } });
     if (!completion.ok) {
       const body = await completion.json().catch(() => ({}));
       throw new Error(body.error?.message || `Presto API returned ${completion.status}.`);
@@ -287,7 +315,7 @@ async function main() {
     await output("preview-url", previewURL);
     notice(`Presto \xB7 Ready ${previewURL}`);
   } catch (error) {
-    await reportFailure(error instanceof Error ? error.message : String(error));
+    await reportFailure("publish", createdPreviewId);
     throw error;
   }
 }

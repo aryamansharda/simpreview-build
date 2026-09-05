@@ -1,9 +1,11 @@
+import { randomUUID } from 'node:crypto';
 import { createReadStream } from 'node:fs';
 import { mkdir, readFile, rm, stat } from 'node:fs/promises';
 import path from 'node:path';
 import { Readable } from 'node:stream';
 import { api } from './api.js';
 import { fail, input, mask, notice, output } from './action-io.js';
+import { artifactDigests } from './digests.js';
 import { oidcToken, pullRequestContext } from './github.js';
 import { detectContainer, findApp, inspectApp } from './inspect.js';
 import { run, runShell } from './process.js';
@@ -17,6 +19,7 @@ export async function main() {
   const eventPath = process.env.GITHUB_EVENT_PATH;
   if (!eventPath) throw new Error('GitHub pull request context is unavailable.');
   const context = pullRequestContext(JSON.parse(await readFile(eventPath, 'utf8')));
+  const publishAttemptId = randomUUID();
   if (context.fromFork) {
     // Fork PRs get no OIDC identity, and their code should not be published under this repo's name anyway.
     notice('::notice title=Presto::Skipped: pull requests from forks are not built. Push a branch in this repository to get a Run button.');
@@ -27,18 +30,33 @@ export async function main() {
   // Authenticate before building so the pull request comment can say "Building…" right away.
   const authenticate = async (phase: 'building' | 'none') => {
     const identity = await oidcToken('presto');
-    const result = await api<{ token: string; commitSha: string; pullRequestTitle?: string }>(`${baseURL}/api/v1/auth/github-actions`, { method: 'POST', body: JSON.stringify({ oidcToken: identity, pullRequest: context.number, phase }) });
+    const result = await api<{ token: string; commitSha: string; pullRequestTitle?: string }>(`${baseURL}/api/v1/auth/github-actions`, { method: 'POST', body: JSON.stringify({ oidcToken: identity, pullRequest: context.number, expectedHeadSha: context.headSHA, phase }) });
     if (result.commitSha !== context.headSHA) throw new Error('GitHub API and workflow event disagree about the pull request head commit.');
     mask(result.token);
     return result;
   };
   let auth = await authenticate('building');
-  const authenticatedAt = Date.now();
-  const reportFailure = async (detail: string) => {
-    await fetch(`${baseURL}/api/v1/workflow/status`, { method: 'POST', headers: { authorization: `Bearer ${auth.token}`, 'content-type': 'application/json' }, body: JSON.stringify({ phase: 'failed', detail }) }).catch(() => undefined);
+  let authenticatedAt = Date.now();
+  const refreshAuthentication = async (force = false) => {
+    if (!force && Date.now() - authenticatedAt <= 20 * 60 * 1000) return;
+    auth = await authenticate('none');
+    authenticatedAt = Date.now();
+  };
+  const reportFailure = async (stage: 'build' | 'publish', previewId?: string) => {
+    try {
+      await refreshAuthentication();
+      const send = () => fetch(`${baseURL}/api/v1/workflow/status`, { method: 'POST', headers: { authorization: `Bearer ${auth.token}`, 'content-type': 'application/json' }, body: JSON.stringify({ phase: 'failed', stage, previewId }) });
+      let response = await send();
+      if (response.status === 401) {
+        await refreshAuthentication(true);
+        response = await send();
+      }
+    } catch {
+      // Reporting must never replace the build or publish error that caused it.
+    }
   };
 
-  let appPath: string; let metadata: Awaited<ReturnType<typeof inspectApp>>; let archive: string; let size: number; let sha256: string;
+  let appPath: string; let metadata: Awaited<ReturnType<typeof inspectApp>>; let archive: string; let size: number; let sha256: string; let md5: string;
   try {
     await mkdir(path.dirname(derivedData), { recursive: true });
     notice('Presto · Building iOS Simulator product');
@@ -62,34 +80,41 @@ export async function main() {
     await rm(archive, { force: true });
     await run('ditto', ['-c', '-k', '--sequesterRsrc', '--keepParent', appPath, archive], { quiet: true });
     size = (await stat(archive)).size;
-    sha256 = (await run('shasum', ['-a', '256', archive], { quiet: true })).trim().split(/\s+/)[0] ?? '';
-    if (!sha256) throw new Error('Could not calculate artifact checksum.');
+    ({ sha256, md5 } = await artifactDigests(archive));
   } catch (error) {
-    await reportFailure(error instanceof Error ? error.message : String(error));
+    await reportFailure('build');
     throw error;
   }
 
+  let createdPreviewId: string | undefined;
   try {
     // The session is short-lived; take a fresh one if the build ran long.
-    if (Date.now() - authenticatedAt > 20 * 60 * 1000) { auth = await authenticate('none'); }
+    await refreshAuthentication();
     mask(auth.token);
     const headers = { authorization: `Bearer ${auth.token}` };
-    const created = await api<{ preview: { previewId: string; status: string }; upload: { url: string } | null }>(`${baseURL}/api/v1/previews`, { method: 'POST', headers, body: JSON.stringify({ pullRequest: context.number, pullRequestTitle: auth.pullRequestTitle || context.title, commitSha: context.headSHA, branch: context.branch, scheme, configuration, ...metadata, artifactSize: size, sha256 }) });
+    const created = await api<{ preview: { previewId: string; status: string }; upload: { url: string; headers?: Record<string, string> } | null }>(`${baseURL}/api/v1/previews`, { method: 'POST', headers, body: JSON.stringify({ publishAttemptId, pullRequest: context.number, pullRequestTitle: auth.pullRequestTitle || context.title, commitSha: context.headSHA, branch: context.branch, scheme, configuration, ...metadata, artifactSize: size, sha256, md5 }) });
+    createdPreviewId = created.preview.previewId;
     if (created.preview.status !== 'ready') {
       if (!created.upload) throw new Error('The preview is not ready and no artifact upload URL was returned.');
       const upload = await fetch(created.upload.url, {
         method: 'PUT',
         body: Readable.toWeb(createReadStream(archive)),
         duplex: 'half',
-        headers: { 'content-type': 'application/zip', 'content-length': String(size) },
+        headers: { ...created.upload.headers, 'content-type': 'application/zip', 'content-length': String(size) },
       } as RequestInit & { duplex: 'half' });
       if (!upload.ok) throw new Error(`Artifact upload failed with ${upload.status}.`);
     }
     // A slow upload can outlive the session; take a fresh one before completing.
-    if (Date.now() - authenticatedAt > 20 * 60 * 1000) { auth = await authenticate('none'); mask(auth.token); }
+    await refreshAuthentication();
+    mask(auth.token);
     // Completion is intentionally idempotent so a retry can repair a missing PR
     // comment even when the artifact became ready during an earlier attempt.
-    const completion = await fetch(`${baseURL}/api/v1/previews/${created.preview.previewId}/complete`, { method: 'POST', headers: { authorization: `Bearer ${auth.token}`, accept: 'application/json' } });
+    const complete = () => fetch(`${baseURL}/api/v1/previews/${created.preview.previewId}/complete`, { method: 'POST', headers: { authorization: `Bearer ${auth.token}`, accept: 'application/json' } });
+    let completion = await complete();
+    if (completion.status === 401) {
+      await refreshAuthentication(true);
+      completion = await complete();
+    }
     if (!completion.ok) {
       const body = await completion.json().catch(() => ({})) as { error?: { message?: string } };
       throw new Error(body.error?.message || `Presto API returned ${completion.status}.`);
@@ -100,7 +125,7 @@ export async function main() {
     await output('preview-url', previewURL);
     notice(`Presto · Ready ${previewURL}`);
   } catch (error) {
-    await reportFailure(error instanceof Error ? error.message : String(error));
+    await reportFailure('publish', createdPreviewId);
     throw error;
   }
 }
