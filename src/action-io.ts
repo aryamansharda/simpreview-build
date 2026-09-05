@@ -23,4 +23,24 @@ export async function saveState(name: string, value: string) {
 
 export function mask(value: string) { process.stdout.write(`::add-mask::${value}\n`); }
 export function notice(message: string) { process.stdout.write(`${message}\n`); }
-export function fail(error: unknown) { const message = error instanceof Error ? error.message : String(error); process.stdout.write(`::error title=Presto::${message.replaceAll('\n', '%0A')}\n`); process.exitCode = 1; }
+
+export function failureAnnotation(error: unknown) {
+  const message = error instanceof Error ? error.message : String(error);
+  const code = typeof error === 'object' && error && 'code' in error ? String(error.code) : '';
+  const title = {
+    seat_required: 'Presto seat required',
+    free_repository_limit: 'Choose the Presto repository',
+    plan_limit_reached: 'Presto free builds used',
+    private_dependency_authentication: 'Private dependency access required',
+  }[code] ?? 'Presto';
+  return `::error title=${title}::${escapeWorkflowCommand(message)}`;
+}
+
+export function fail(error: unknown) {
+  process.stdout.write(`${failureAnnotation(error)}\n`);
+  process.exitCode = 1;
+}
+
+function escapeWorkflowCommand(value: string) {
+  return value.replaceAll('%', '%25').replaceAll('\r', '%0D').replaceAll('\n', '%0A');
+}

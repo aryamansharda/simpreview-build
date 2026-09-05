@@ -6,7 +6,10 @@ import { Readable } from 'node:stream';
 import { api } from './api.js';
 import { fail, input, mask, notice, output, saveState } from './action-io.js';
 import { artifactDigests } from './digests.js';
+import { actionAuthenticationPayload, type ActionAuthenticationPhase } from './auth-payload.js';
+import { actionableBuildFailure } from './build-diagnostics.js';
 import { oidcToken, pullRequestContext } from './github.js';
+import { startWorkflowHeartbeat } from './heartbeat.js';
 import { detectContainer, findApp, inspectApp } from './inspect.js';
 import { run, runShell } from './process.js';
 
@@ -31,19 +34,28 @@ export async function main() {
 
   const baseURL = (input('api-url') || 'https://presto.digitalbunker.dev').replace(/\/$/, '');
   // Authenticate before building so the pull request comment can say "Building…" right away.
-  const authenticate = async (phase: 'building' | 'none') => {
+  const authenticate = async (phase: ActionAuthenticationPhase) => {
     const identity = await oidcToken('presto');
-    const result = await api<{ token: string; commitSha: string; pullRequestTitle?: string }>(`${baseURL}/api/v1/auth/github-actions`, { method: 'POST', body: JSON.stringify({ oidcToken: identity, pullRequest: context.number, expectedHeadSha: context.headSHA, phase }) });
+    const result = await api<{ token: string; commitSha: string; pullRequestTitle?: string }>(`${baseURL}/api/v1/auth/github-actions`, { method: 'POST', body: JSON.stringify(actionAuthenticationPayload({ oidcToken: identity, pullRequest: context.number, expectedHeadSha: context.headSHA, phase, scheme })) });
     if (result.commitSha !== context.headSHA) throw new Error('GitHub API and workflow event disagree about the pull request head commit.');
     mask(result.token);
     return result;
   };
   let auth = await authenticate('building');
   let authenticatedAt = Date.now();
+  let authenticationRefresh: Promise<void> | undefined;
   const refreshAuthentication = async (force = false) => {
     if (!force && Date.now() - authenticatedAt <= 20 * 60 * 1000) return;
-    auth = await authenticate('none');
-    authenticatedAt = Date.now();
+    if (!authenticationRefresh) {
+      authenticationRefresh = (async () => {
+        const refreshed = await authenticate('none');
+        auth = refreshed;
+        authenticatedAt = Date.now();
+      })().finally(() => {
+        authenticationRefresh = undefined;
+      });
+    }
+    await authenticationRefresh;
   };
   const reportFailure = async (stage: 'build' | 'publish', previewId?: string) => {
     try {
@@ -58,6 +70,7 @@ export async function main() {
       // Reporting must never replace the build or publish error that caused it.
     }
   };
+  const stopHeartbeat = startWorkflowHeartbeat(() => refreshAuthentication(true));
 
   let appPath: string; let metadata: Awaited<ReturnType<typeof inspectApp>>; let archive: string; let size: number; let sha256: string; let md5: string;
   try {
@@ -85,8 +98,9 @@ export async function main() {
     size = (await stat(archive)).size;
     ({ sha256, md5 } = await artifactDigests(archive));
   } catch (error) {
+    stopHeartbeat();
     await reportFailure('build');
-    throw error;
+    throw actionableBuildFailure(error);
   }
 
   let createdPreviewId: string | undefined;
@@ -130,7 +144,9 @@ export async function main() {
     await output('preview-url', previewURL);
     notice(`Presto · Ready ${previewURL}`);
     await saveState('PRESTO_FINALIZED', 'true');
+    stopHeartbeat();
   } catch (error) {
+    stopHeartbeat();
     await reportFailure('publish', createdPreviewId);
     throw error;
   }

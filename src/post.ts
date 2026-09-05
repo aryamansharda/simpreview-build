@@ -1,5 +1,6 @@
 import { readFile } from 'node:fs/promises';
 import { api } from './api.js';
+import { actionAuthenticationPayload } from './auth-payload.js';
 import { input, mask, notice } from './action-io.js';
 import { oidcToken, pullRequestContext } from './github.js';
 import { pendingPostReport } from './post-policy.js';
@@ -13,10 +14,11 @@ export async function post() {
   if (context.fromFork) return;
 
   const baseURL = (input('api-url') || 'https://presto.digitalbunker.dev').replace(/\/$/, '');
+  const scheme = input('scheme', true);
   const identity = await oidcToken('presto');
   const auth = await api<{ token: string; commitSha: string }>(`${baseURL}/api/v1/auth/github-actions`, {
     method: 'POST',
-    body: JSON.stringify({ oidcToken: identity, pullRequest: context.number, expectedHeadSha: context.headSHA, phase: 'none' }),
+    body: JSON.stringify(actionAuthenticationPayload({ oidcToken: identity, pullRequest: context.number, expectedHeadSha: context.headSHA, phase: 'none', scheme })),
   });
   if (auth.commitSha !== context.headSHA) throw new Error('GitHub API and workflow event disagree about the pull request head commit.');
   mask(auth.token);

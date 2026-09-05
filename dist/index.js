@@ -8,13 +8,29 @@ import path2 from "node:path";
 import { Readable } from "node:stream";
 
 // src/api.ts
+var PrestoAPIError = class extends Error {
+  constructor(code, message, status, details) {
+    super(message);
+    this.code = code;
+    this.status = status;
+    this.details = details;
+    this.name = "PrestoAPIError";
+  }
+};
 async function api(url, init = {}) {
   const headers = new Headers(init.headers);
   headers.set("accept", "application/json");
   if (init.body) headers.set("content-type", "application/json");
   const response = await fetch(url, { ...init, headers });
-  const body = await response.json();
-  if (!response.ok) throw new Error(body.error?.message || `Presto API returned ${response.status}.`);
+  const body = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new PrestoAPIError(
+      body.error?.code || "presto_api_error",
+      body.error?.message || `Presto API returned ${response.status}.`,
+      response.status,
+      body.error?.details
+    );
+  }
   return body;
 }
 
@@ -48,11 +64,24 @@ function notice(message) {
   process.stdout.write(`${message}
 `);
 }
-function fail(error) {
+function failureAnnotation(error) {
   const message = error instanceof Error ? error.message : String(error);
-  process.stdout.write(`::error title=Presto::${message.replaceAll("\n", "%0A")}
+  const code = typeof error === "object" && error && "code" in error ? String(error.code) : "";
+  const title = {
+    seat_required: "Presto seat required",
+    free_repository_limit: "Choose the Presto repository",
+    plan_limit_reached: "Presto free builds used",
+    private_dependency_authentication: "Private dependency access required"
+  }[code] ?? "Presto";
+  return `::error title=${title}::${escapeWorkflowCommand(message)}`;
+}
+function fail(error) {
+  process.stdout.write(`${failureAnnotation(error)}
 `);
   process.exitCode = 1;
+}
+function escapeWorkflowCommand(value) {
+  return value.replaceAll("%", "%25").replaceAll("\r", "%0D").replaceAll("\n", "%0A");
 }
 
 // src/digests.ts
@@ -66,6 +95,94 @@ async function artifactDigests(file) {
     md5.update(chunk);
   }
   return { sha256: sha256.digest("hex"), md5: md5.digest("hex") };
+}
+
+// src/auth-payload.ts
+function actionAuthenticationPayload(input2) {
+  return {
+    oidcToken: input2.oidcToken,
+    pullRequest: input2.pullRequest,
+    expectedHeadSha: input2.expectedHeadSha,
+    phase: input2.phase,
+    scheme: input2.scheme
+  };
+}
+
+// src/process.ts
+import { spawn } from "node:child_process";
+var diagnosticLimit = 64 * 1024;
+var CommandError = class extends Error {
+  constructor(command, exitCode, diagnosticOutput) {
+    super(`${command} exited with ${exitCode ?? "an unknown status"}. Review the Actions log for details.`);
+    this.command = command;
+    this.exitCode = exitCode;
+    this.diagnosticOutput = diagnosticOutput;
+    this.name = "CommandError";
+  }
+};
+function appendDiagnostic(current, chunk) {
+  const next = current + chunk.toString();
+  return next.length <= diagnosticLimit ? next : next.slice(-diagnosticLimit);
+}
+async function run(command, args, options = {}) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, { cwd: options.cwd, env: process.env, stdio: ["ignore", "pipe", "pipe"] });
+    let stdout = "";
+    let diagnosticOutput = "";
+    child.stdout.on("data", (chunk) => {
+      const text = chunk.toString();
+      stdout += text;
+      diagnosticOutput = appendDiagnostic(diagnosticOutput, text);
+      if (!options.quiet) process.stdout.write(text);
+    });
+    child.stderr.on("data", (chunk) => {
+      diagnosticOutput = appendDiagnostic(diagnosticOutput, chunk);
+      if (!options.quiet) process.stderr.write(chunk);
+    });
+    child.on("error", reject);
+    child.on("close", (code) => code === 0 ? resolve(stdout) : reject(new CommandError(command, code, diagnosticOutput)));
+  });
+}
+async function runShell(script) {
+  return run("/bin/zsh", ["-eo", "pipefail", "-c", script]);
+}
+
+// src/build-diagnostics.ts
+var BuildDiagnosticError = class extends Error {
+  code = "private_dependency_authentication";
+  constructor() {
+    super(
+      "A private build dependency could not authenticate. Configure its read-only HTTPS token or SSH key in this job before the Presto step, then rerun the workflow. GitHub\u2019s checkout token normally cannot read a different private repository. The failing repository and credentials are intentionally not repeated here; review the build log for the dependency name."
+    );
+    this.name = "BuildDiagnosticError";
+  }
+};
+var unambiguousGitAuthenticationFailures = [
+  /could not read username for/i,
+  /authentication failed for/i,
+  /permission denied \(publickey\)/i,
+  /http basic: access denied/i,
+  /the requested url returned error:\s*(?:401|403)\b/i,
+  /remote:\s*(?:repository not found|invalid username or password|access denied)/i
+];
+var dependencyResolutionContext = [
+  /could not resolve package dependencies/i,
+  /failed to clone repository/i,
+  /error installing\s+[^\r\n]+/i,
+  /swift package manager|swiftpm|package\.resolved/i,
+  /cocoapods|pod install|pod repo/i
+];
+var contextualAuthenticationFailures = [
+  /(?:authentication|authorization) (?:failed|required)/i,
+  /(?:missing|invalid|no) credentials?/i,
+  /unauthorized|forbidden/i,
+  /(?:http|status|response)[^\r\n]{0,24}\b(?:401|403)\b/i
+];
+function actionableBuildFailure(error) {
+  if (!(error instanceof CommandError)) return error;
+  const output2 = error.diagnosticOutput;
+  const isAuthenticationFailure = unambiguousGitAuthenticationFailures.some((pattern) => pattern.test(output2)) || dependencyResolutionContext.some((pattern) => pattern.test(output2)) && contextualAuthenticationFailures.some((pattern) => pattern.test(output2));
+  return isAuthenticationFailure ? new BuildDiagnosticError() : error;
 }
 
 // src/github.ts
@@ -92,33 +209,32 @@ async function oidcToken(audience) {
   return body.value;
 }
 
+// src/heartbeat.ts
+var workflowHeartbeatIntervalMs = 15 * 60 * 1e3;
+var defaultScheduler = {
+  every: (callback, intervalMs) => setInterval(callback, intervalMs),
+  cancel: (handle) => clearInterval(handle)
+};
+function startWorkflowHeartbeat(heartbeat, scheduler = defaultScheduler) {
+  let active = true;
+  let running = false;
+  const timer = scheduler.every(() => {
+    if (!active || running) return;
+    running = true;
+    void heartbeat().catch(() => void 0).finally(() => {
+      running = false;
+    });
+  }, workflowHeartbeatIntervalMs);
+  timer.unref?.();
+  return () => {
+    active = false;
+    scheduler.cancel(timer);
+  };
+}
+
 // src/inspect.ts
 import { access, readdir, stat } from "node:fs/promises";
 import path from "node:path";
-
-// src/process.ts
-import { spawn } from "node:child_process";
-async function run(command, args, options = {}) {
-  return new Promise((resolve, reject) => {
-    const child = spawn(command, args, { cwd: options.cwd, env: process.env, stdio: ["ignore", "pipe", "pipe"] });
-    let stdout = "";
-    child.stdout.on("data", (chunk) => {
-      const text = chunk.toString();
-      stdout += text;
-      if (!options.quiet) process.stdout.write(text);
-    });
-    child.stderr.on("data", (chunk) => {
-      if (!options.quiet) process.stderr.write(chunk);
-    });
-    child.on("error", reject);
-    child.on("close", (code) => code === 0 ? resolve(stdout) : reject(new Error(`${command} exited with ${code}. Review the Actions log for details.`)));
-  });
-}
-async function runShell(script) {
-  return run("/bin/zsh", ["-eo", "pipefail", "-c", script]);
-}
-
-// src/inspect.ts
 async function detectContainer(root, workspace, project) {
   if (workspace && project) throw new Error("Provide either workspace or project, not both.");
   if (workspace) return ["-workspace", workspace];
@@ -236,17 +352,26 @@ async function main() {
   const baseURL = (input("api-url") || "https://presto.digitalbunker.dev").replace(/\/$/, "");
   const authenticate = async (phase) => {
     const identity = await oidcToken("presto");
-    const result = await api(`${baseURL}/api/v1/auth/github-actions`, { method: "POST", body: JSON.stringify({ oidcToken: identity, pullRequest: context.number, expectedHeadSha: context.headSHA, phase }) });
+    const result = await api(`${baseURL}/api/v1/auth/github-actions`, { method: "POST", body: JSON.stringify(actionAuthenticationPayload({ oidcToken: identity, pullRequest: context.number, expectedHeadSha: context.headSHA, phase, scheme })) });
     if (result.commitSha !== context.headSHA) throw new Error("GitHub API and workflow event disagree about the pull request head commit.");
     mask(result.token);
     return result;
   };
   let auth = await authenticate("building");
   let authenticatedAt = Date.now();
+  let authenticationRefresh;
   const refreshAuthentication = async (force = false) => {
     if (!force && Date.now() - authenticatedAt <= 20 * 60 * 1e3) return;
-    auth = await authenticate("none");
-    authenticatedAt = Date.now();
+    if (!authenticationRefresh) {
+      authenticationRefresh = (async () => {
+        const refreshed = await authenticate("none");
+        auth = refreshed;
+        authenticatedAt = Date.now();
+      })().finally(() => {
+        authenticationRefresh = void 0;
+      });
+    }
+    await authenticationRefresh;
   };
   const reportFailure = async (stage, previewId) => {
     try {
@@ -260,6 +385,7 @@ async function main() {
     } catch {
     }
   };
+  const stopHeartbeat = startWorkflowHeartbeat(() => refreshAuthentication(true));
   let appPath;
   let metadata;
   let archive;
@@ -288,8 +414,9 @@ async function main() {
     size = (await stat2(archive)).size;
     ({ sha256, md5 } = await artifactDigests(archive));
   } catch (error) {
+    stopHeartbeat();
     await reportFailure("build");
-    throw error;
+    throw actionableBuildFailure(error);
   }
   let createdPreviewId;
   try {
@@ -328,7 +455,9 @@ async function main() {
     await output("preview-url", previewURL);
     notice(`Presto \xB7 Ready ${previewURL}`);
     await saveState("PRESTO_FINALIZED", "true");
+    stopHeartbeat();
   } catch (error) {
+    stopHeartbeat();
     await reportFailure("publish", createdPreviewId);
     throw error;
   }

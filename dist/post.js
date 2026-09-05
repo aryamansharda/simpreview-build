@@ -4,14 +4,41 @@ import { createRequire as __createRequire } from "module";const require=__create
 import { readFile } from "node:fs/promises";
 
 // src/api.ts
+var PrestoAPIError = class extends Error {
+  constructor(code, message, status, details) {
+    super(message);
+    this.code = code;
+    this.status = status;
+    this.details = details;
+    this.name = "PrestoAPIError";
+  }
+};
 async function api(url, init = {}) {
   const headers = new Headers(init.headers);
   headers.set("accept", "application/json");
   if (init.body) headers.set("content-type", "application/json");
   const response = await fetch(url, { ...init, headers });
-  const body = await response.json();
-  if (!response.ok) throw new Error(body.error?.message || `Presto API returned ${response.status}.`);
+  const body = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new PrestoAPIError(
+      body.error?.code || "presto_api_error",
+      body.error?.message || `Presto API returned ${response.status}.`,
+      response.status,
+      body.error?.details
+    );
+  }
   return body;
+}
+
+// src/auth-payload.ts
+function actionAuthenticationPayload(input2) {
+  return {
+    oidcToken: input2.oidcToken,
+    pullRequest: input2.pullRequest,
+    expectedHeadSha: input2.expectedHeadSha,
+    phase: input2.phase,
+    scheme: input2.scheme
+  };
 }
 
 // src/action-io.ts
@@ -71,10 +98,11 @@ async function post() {
   const context = pullRequestContext(JSON.parse(await readFile(eventPath, "utf8")));
   if (context.fromFork) return;
   const baseURL = (input("api-url") || "https://presto.digitalbunker.dev").replace(/\/$/, "");
+  const scheme = input("scheme", true);
   const identity = await oidcToken("presto");
   const auth = await api(`${baseURL}/api/v1/auth/github-actions`, {
     method: "POST",
-    body: JSON.stringify({ oidcToken: identity, pullRequest: context.number, expectedHeadSha: context.headSHA, phase: "none" })
+    body: JSON.stringify(actionAuthenticationPayload({ oidcToken: identity, pullRequest: context.number, expectedHeadSha: context.headSHA, phase: "none", scheme }))
   });
   if (auth.commitSha !== context.headSHA) throw new Error("GitHub API and workflow event disagree about the pull request head commit.");
   mask(auth.token);
