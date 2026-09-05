@@ -1,5 +1,5 @@
 name: Presto Build
-description: Build an iOS Simulator app and publish a private Presto for the current pull request.
+description: Build and publish a private iOS Simulator app for the current pull request.
 author: Presto
 branding:
   icon: play
@@ -40,3 +40,5 @@ outputs:
 runs:
   using: node24
   main: dist/index.js
+  post: dist/post.js
+  post-if: always()

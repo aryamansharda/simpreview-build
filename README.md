@@ -13,4 +13,4 @@ steps:
       scheme: MyApp
 ```
 
-The action builds an unsigned `iphonesimulator` product, validates its bundle metadata and architectures, packages it, authenticates with GitHub OIDC, uploads directly to private storage, and completes the preview.
+The action builds an unsigned `iphonesimulator` product, validates its bundle metadata and architectures, packages it, authenticates with GitHub OIDC, uploads directly to private storage, and completes the preview. If GitHub cancels or times out the action before it finishes, the post-run hook replaces the stale Preparing comment with the failure state whenever the runner still has time to perform cleanup.

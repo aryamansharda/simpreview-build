@@ -4,13 +4,15 @@ import { mkdir, readFile, rm, stat } from 'node:fs/promises';
 import path from 'node:path';
 import { Readable } from 'node:stream';
 import { api } from './api.js';
-import { fail, input, mask, notice, output } from './action-io.js';
+import { fail, input, mask, notice, output, saveState } from './action-io.js';
 import { artifactDigests } from './digests.js';
 import { oidcToken, pullRequestContext } from './github.js';
 import { detectContainer, findApp, inspectApp } from './inspect.js';
 import { run, runShell } from './process.js';
 
 export async function main() {
+  await saveState('PRESTO_STARTED', 'true');
+  await saveState('PRESTO_STAGE', 'build');
   const root = process.env.GITHUB_WORKSPACE || process.cwd();
   const scheme = input('scheme', true);
   const configuration = input('configuration') || 'Debug';
@@ -23,6 +25,7 @@ export async function main() {
   if (context.fromFork) {
     // Fork PRs get no OIDC identity, and their code should not be published under this repo's name anyway.
     notice('::notice title=Presto::Skipped: pull requests from forks are not built. Push a branch in this repository to get a Run button.');
+    await saveState('PRESTO_FINALIZED', 'true');
     return;
   }
 
@@ -88,12 +91,14 @@ export async function main() {
 
   let createdPreviewId: string | undefined;
   try {
+    await saveState('PRESTO_STAGE', 'publish');
     // The session is short-lived; take a fresh one if the build ran long.
     await refreshAuthentication();
     mask(auth.token);
     const headers = { authorization: `Bearer ${auth.token}` };
     const created = await api<{ preview: { previewId: string; status: string }; upload: { url: string; headers?: Record<string, string> } | null }>(`${baseURL}/api/v1/previews`, { method: 'POST', headers, body: JSON.stringify({ publishAttemptId, pullRequest: context.number, pullRequestTitle: auth.pullRequestTitle || context.title, commitSha: context.headSHA, branch: context.branch, scheme, configuration, ...metadata, artifactSize: size, sha256, md5 }) });
     createdPreviewId = created.preview.previewId;
+    await saveState('PRESTO_PREVIEW_ID', createdPreviewId);
     if (created.preview.status !== 'ready') {
       if (!created.upload) throw new Error('The preview is not ready and no artifact upload URL was returned.');
       const upload = await fetch(created.upload.url, {
@@ -124,6 +129,7 @@ export async function main() {
     await output('preview-id', created.preview.previewId);
     await output('preview-url', previewURL);
     notice(`Presto · Ready ${previewURL}`);
+    await saveState('PRESTO_FINALIZED', 'true');
   } catch (error) {
     await reportFailure('publish', createdPreviewId);
     throw error;

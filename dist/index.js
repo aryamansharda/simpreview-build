@@ -32,6 +32,14 @@ async function output(name, value) {
   await appendFile(path3, `${name}=${value}
 `, "utf8");
 }
+async function saveState(name, value) {
+  if (!/^[A-Z][A-Z0-9_]*$/.test(name)) throw new Error("Action state names must use uppercase letters, numbers, and underscores.");
+  if (value.includes("\n") || value.includes("\r")) throw new Error("Action state values must fit on one line.");
+  const statePath = process.env.GITHUB_STATE;
+  if (!statePath) return;
+  await appendFile(statePath, `${name}=${value}
+`, "utf8");
+}
 function mask(value) {
   process.stdout.write(`::add-mask::${value}
 `);
@@ -209,6 +217,8 @@ function optionalString(plist, key) {
 
 // src/index.ts
 async function main() {
+  await saveState("PRESTO_STARTED", "true");
+  await saveState("PRESTO_STAGE", "build");
   const root = process.env.GITHUB_WORKSPACE || process.cwd();
   const scheme = input("scheme", true);
   const configuration = input("configuration") || "Debug";
@@ -220,6 +230,7 @@ async function main() {
   const publishAttemptId = randomUUID();
   if (context.fromFork) {
     notice("::notice title=Presto::Skipped: pull requests from forks are not built. Push a branch in this repository to get a Run button.");
+    await saveState("PRESTO_FINALIZED", "true");
     return;
   }
   const baseURL = (input("api-url") || "https://presto.digitalbunker.dev").replace(/\/$/, "");
@@ -282,11 +293,13 @@ async function main() {
   }
   let createdPreviewId;
   try {
+    await saveState("PRESTO_STAGE", "publish");
     await refreshAuthentication();
     mask(auth.token);
     const headers = { authorization: `Bearer ${auth.token}` };
     const created = await api(`${baseURL}/api/v1/previews`, { method: "POST", headers, body: JSON.stringify({ publishAttemptId, pullRequest: context.number, pullRequestTitle: auth.pullRequestTitle || context.title, commitSha: context.headSHA, branch: context.branch, scheme, configuration, ...metadata, artifactSize: size, sha256, md5 }) });
     createdPreviewId = created.preview.previewId;
+    await saveState("PRESTO_PREVIEW_ID", createdPreviewId);
     if (created.preview.status !== "ready") {
       if (!created.upload) throw new Error("The preview is not ready and no artifact upload URL was returned.");
       const upload = await fetch(created.upload.url, {
@@ -314,6 +327,7 @@ async function main() {
     await output("preview-id", created.preview.previewId);
     await output("preview-url", previewURL);
     notice(`Presto \xB7 Ready ${previewURL}`);
+    await saveState("PRESTO_FINALIZED", "true");
   } catch (error) {
     await reportFailure("publish", createdPreviewId);
     throw error;

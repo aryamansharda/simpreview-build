@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "build": "esbuild src/index.ts --bundle --platform=node --target=node20 --format=esm --outfile=dist/index.js --banner:js='import { createRequire as __createRequire } from \"module\";const require=__createRequire(import.meta.url);'",
+    "build": "esbuild src/index.ts src/post.ts --bundle --platform=node --target=node20 --format=esm --outdir=dist --banner:js='import { createRequire as __createRequire } from \"module\";const require=__createRequire(import.meta.url);'",
     "typecheck": "tsc --noEmit",
     "test": "node --import tsx --test tests/*.test.ts"
   },
@@ -15,4 +15,3 @@
     "typescript": "^5.9.3"
   }
 }
-
