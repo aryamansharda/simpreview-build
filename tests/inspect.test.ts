@@ -117,6 +117,24 @@ test('findApp uses Xcode product metadata instead of a newer unrelated app', asy
   }
 });
 
+test('findApp selects the requested product when one scheme builds multiple iOS apps', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'presto-products-'));
+  try {
+    const consumer = path.join(root, 'Build', 'Products', 'Debug-iphonesimulator', 'Consumer.app');
+    const enterprise = path.join(root, 'Build', 'Products', 'Debug-iphonesimulator', 'Enterprise.app');
+    await mkdir(consumer, { recursive: true });
+    await mkdir(enterprise, { recursive: true });
+    const settings = JSON.stringify([
+      { buildSettings: { PRODUCT_TYPE: 'com.apple.product-type.application', PLATFORM_NAME: 'iphonesimulator', TARGET_BUILD_DIR: path.dirname(consumer), WRAPPER_NAME: path.basename(consumer) } },
+      { buildSettings: { PRODUCT_TYPE: 'com.apple.product-type.application', PLATFORM_NAME: 'iphonesimulator', TARGET_BUILD_DIR: path.dirname(enterprise), WRAPPER_NAME: path.basename(enterprise) } },
+    ]);
+    assert.equal(await findApp(root, undefined, settings, 'Enterprise'), enterprise);
+    await assert.rejects(findApp(root, undefined, settings, 'Missing'), /Choose one of: Consumer, Enterprise/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test('findApp requires app-path when a custom build leaves multiple app products', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'presto-products-'));
   try {

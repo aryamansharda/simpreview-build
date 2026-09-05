@@ -17,7 +17,7 @@ steps:
 
 The action builds an unsigned `iphonesimulator` product, validates its bundle metadata and architectures, packages it, authenticates with GitHub OIDC, uploads directly to private storage, and completes the preview. If GitHub cancels or times out the action before it finishes, the post-run hook replaces the stale Preparing comment with the failure state whenever the runner still has time to perform cleanup.
 
-If one scheme produces more than one iOS app, set `app-path` to the app reviewers should run. On a clean runner, Presto performs the normal build and selects that product. If an earlier CI step already created the app at that path, Presto reuses it without compiling again.
+If one scheme produces more than one iOS app, set `app-name` to the product reviewers should run; Presto uses Xcode’s build settings to locate it. Use `app-path` when an earlier CI step already created the app and Presto should reuse it without compiling again.
 
 ## Use your project’s Xcode version
 

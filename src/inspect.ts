@@ -88,11 +88,16 @@ export function simulatorAppPathsFromBuildSettings(output: string): string[] {
   });
 }
 
-export async function findApp(derivedData: string, explicit?: string, buildSettingsOutput?: string): Promise<string> {
+export async function findApp(derivedData: string, explicit?: string, buildSettingsOutput?: string, appName?: string): Promise<string> {
+  if (explicit && appName) throw new Error('Provide either app-path or app-name, not both.');
   if (explicit) { await access(explicit); return path.resolve(explicit); }
   if (buildSettingsOutput) {
-    const candidates = [...new Set(simulatorAppPathsFromBuildSettings(buildSettingsOutput))];
-    if (candidates.length > 1) throw new Error(`The scheme builds more than one iOS app (${candidates.map(candidate => path.basename(candidate)).join(', ')}). Set the app-path input to the app reviewers should run.`);
+    const allCandidates = [...new Set(simulatorAppPathsFromBuildSettings(buildSettingsOutput))];
+    const candidates = appName
+      ? allCandidates.filter(candidate => path.basename(candidate, '.app') === appName)
+      : allCandidates;
+    if (appName && candidates.length === 0) throw new Error(`The scheme did not build an iOS app named ${appName}. Choose one of: ${allCandidates.map(candidate => path.basename(candidate, '.app')).join(', ') || 'none'}.`);
+    if (candidates.length > 1) throw new Error(`The scheme builds more than one iOS app (${candidates.map(candidate => path.basename(candidate)).join(', ')}). Set the app-name input to the app reviewers should run.`);
     if (candidates[0]) {
       await access(candidates[0]);
       return candidates[0];
@@ -103,10 +108,16 @@ export async function findApp(derivedData: string, explicit?: string, buildSetti
   const found: Array<{ file: string; modified: number }> = [];
   async function walk(directory: string) { for (const entry of await readdir(directory, { withFileTypes: true })) { const file = path.join(directory, entry.name); if (entry.isDirectory() && entry.name.endsWith('.app')) found.push({ file, modified: (await stat(file)).mtimeMs }); else if (entry.isDirectory()) await walk(file); } }
   await walk(products);
-  found.sort((a, b) => b.modified - a.modified);
-  if (!found[0]) throw new Error('Xcode completed but no .app product was found in DerivedData.');
-  if (found.length > 1) throw new Error(`More than one .app product was found (${found.map(candidate => path.basename(candidate.file)).join(', ')}). Set the app-path input to the app reviewers should run.`);
-  return found[0].file;
+  const candidates = appName
+    ? found.filter(candidate => path.basename(candidate.file, '.app') === appName)
+    : found;
+  candidates.sort((a, b) => b.modified - a.modified);
+  if (!candidates[0]) {
+    if (appName) throw new Error(`Xcode completed but no .app product named ${appName} was found in DerivedData.`);
+    throw new Error('Xcode completed but no .app product was found in DerivedData.');
+  }
+  if (candidates.length > 1) throw new Error(`More than one .app product was found (${candidates.map(candidate => path.basename(candidate.file)).join(', ')}). Set the app-name or app-path input to the app reviewers should run.`);
+  return candidates[0].file;
 }
 
 /** Reuse an app that CI already produced; otherwise let the default builder create it. */

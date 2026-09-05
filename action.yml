@@ -28,6 +28,9 @@ inputs:
   app-path:
     description: Optional path to the Simulator .app to publish. Existing products are reused; otherwise the default build runs first.
     required: false
+  app-name:
+    description: Optional app product name to select when a scheme builds more than one iOS app.
+    required: false
   api-url:
     description: Presto API origin.
     required: false

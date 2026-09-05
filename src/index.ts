@@ -83,6 +83,8 @@ export async function main() {
     notice('Presto · Building iOS Simulator product');
     let buildSettingsOutput: string | undefined;
     const appPathInput = input('app-path');
+    const appNameInput = input('app-name');
+    if (appPathInput && appNameInput) throw new Error('Provide either app-path or app-name, not both.');
     const requestedAppPath = appPathInput ? path.resolve(root, appPathInput) : undefined;
     if (customCommand) await runShell(customCommand);
     else if (await needsDefaultBuild(requestedAppPath)) {
@@ -93,7 +95,7 @@ export async function main() {
       buildSettingsOutput = await run('xcodebuild', [...buildArguments, '-showBuildSettings', '-json'], { cwd: root, quiet: true });
     }
 
-    appPath = await findApp(derivedData, requestedAppPath, buildSettingsOutput);
+    appPath = await findApp(derivedData, requestedAppPath, buildSettingsOutput, appNameInput || undefined);
     metadata = await inspectApp(appPath);
     notice(`Presto · Validated ${metadata.displayName} (${metadata.architectures.join(', ')})`);
 

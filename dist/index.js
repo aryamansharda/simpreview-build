@@ -294,17 +294,20 @@ function simulatorAppPathsFromBuildSettings(output2) {
     return directory && wrapper ? [path.join(directory, wrapper)] : [];
   });
 }
-async function findApp(derivedData, explicit, buildSettingsOutput) {
+async function findApp(derivedData, explicit, buildSettingsOutput, appName) {
+  if (explicit && appName) throw new Error("Provide either app-path or app-name, not both.");
   if (explicit) {
     await access(explicit);
     return path.resolve(explicit);
   }
   if (buildSettingsOutput) {
-    const candidates = [...new Set(simulatorAppPathsFromBuildSettings(buildSettingsOutput))];
-    if (candidates.length > 1) throw new Error(`The scheme builds more than one iOS app (${candidates.map((candidate) => path.basename(candidate)).join(", ")}). Set the app-path input to the app reviewers should run.`);
-    if (candidates[0]) {
-      await access(candidates[0]);
-      return candidates[0];
+    const allCandidates = [...new Set(simulatorAppPathsFromBuildSettings(buildSettingsOutput))];
+    const candidates2 = appName ? allCandidates.filter((candidate) => path.basename(candidate, ".app") === appName) : allCandidates;
+    if (appName && candidates2.length === 0) throw new Error(`The scheme did not build an iOS app named ${appName}. Choose one of: ${allCandidates.map((candidate) => path.basename(candidate, ".app")).join(", ") || "none"}.`);
+    if (candidates2.length > 1) throw new Error(`The scheme builds more than one iOS app (${candidates2.map((candidate) => path.basename(candidate)).join(", ")}). Set the app-name input to the app reviewers should run.`);
+    if (candidates2[0]) {
+      await access(candidates2[0]);
+      return candidates2[0];
     }
     throw new Error("The selected scheme did not produce an iOS Simulator app. Set the scheme or app-path input.");
   }
@@ -318,10 +321,14 @@ async function findApp(derivedData, explicit, buildSettingsOutput) {
     }
   }
   await walk(products);
-  found.sort((a, b) => b.modified - a.modified);
-  if (!found[0]) throw new Error("Xcode completed but no .app product was found in DerivedData.");
-  if (found.length > 1) throw new Error(`More than one .app product was found (${found.map((candidate) => path.basename(candidate.file)).join(", ")}). Set the app-path input to the app reviewers should run.`);
-  return found[0].file;
+  const candidates = appName ? found.filter((candidate) => path.basename(candidate.file, ".app") === appName) : found;
+  candidates.sort((a, b) => b.modified - a.modified);
+  if (!candidates[0]) {
+    if (appName) throw new Error(`Xcode completed but no .app product named ${appName} was found in DerivedData.`);
+    throw new Error("Xcode completed but no .app product was found in DerivedData.");
+  }
+  if (candidates.length > 1) throw new Error(`More than one .app product was found (${candidates.map((candidate) => path.basename(candidate.file)).join(", ")}). Set the app-name or app-path input to the app reviewers should run.`);
+  return candidates[0].file;
 }
 async function needsDefaultBuild(explicitAppPath) {
   if (!explicitAppPath) return true;
@@ -424,6 +431,8 @@ async function main() {
     notice("Presto \xB7 Building iOS Simulator product");
     let buildSettingsOutput;
     const appPathInput = input("app-path");
+    const appNameInput = input("app-name");
+    if (appPathInput && appNameInput) throw new Error("Provide either app-path or app-name, not both.");
     const requestedAppPath = appPathInput ? path2.resolve(root, appPathInput) : void 0;
     if (customCommand) await runShell(customCommand);
     else if (await needsDefaultBuild(requestedAppPath)) {
@@ -432,7 +441,7 @@ async function main() {
       await run("xcodebuild", [...buildArguments, "build"], { cwd: root });
       buildSettingsOutput = await run("xcodebuild", [...buildArguments, "-showBuildSettings", "-json"], { cwd: root, quiet: true });
     }
-    appPath = await findApp(derivedData, requestedAppPath, buildSettingsOutput);
+    appPath = await findApp(derivedData, requestedAppPath, buildSettingsOutput, appNameInput || void 0);
     metadata = await inspectApp(appPath);
     notice(`Presto \xB7 Validated ${metadata.displayName} (${metadata.architectures.join(", ")})`);
     const staging = path2.resolve(root, ".presto");
